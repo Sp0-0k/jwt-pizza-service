@@ -4,7 +4,6 @@ jest.mock('bcrypt', () => ({
 }));
 
 const { DB } = require('../src/database/database.js');
-const { StatusCodeError } = require('../src/endpointHelper.js');
 const dbModel = require('../src/database/dbModel.js');
 const { makeAdmin } = require('./helpers/fixtures.js');
 
@@ -199,7 +198,6 @@ describe('token storage', () => {
   });
 });
 
-// The helpers below are used by the describe blocks added in later tasks.
 describe('menu', () => {
   test('getMenu returns the rows and closes the connection', async () => {
     const rows = [{ id: 1, title: 'Veggie' }];
@@ -386,4 +384,72 @@ describe('stores', () => {
   });
 });
 
-module.exports = { testConfig, createFakeConnection, createTestDb, StatusCodeError, dbModel, makeAdmin };
+describe('helpers', () => {
+  test.each([
+    [1, 0],
+    [3, 20],
+    [undefined, 0],
+  ])('getOffset(%s) is %s with 10 per page', (page, expected) => {
+    expect(createTestDb(createFakeConnection()).getOffset(page, 10)).toBe(expected);
+  });
+
+  test.each([
+    ['a.b.sig', 'sig'],
+    ['a.b', ''],
+    ['', ''],
+  ])('getTokenSignature(%j) is %j', (token, expected) => {
+    expect(createTestDb(createFakeConnection()).getTokenSignature(token)).toBe(expected);
+  });
+
+  test('getID returns the id of the matching row', async () => {
+    const conn = createFakeConnection([[{ id: 4 }]]);
+    await expect(createTestDb(conn).getID(conn, 'name', 'pizzaPocket', 'franchise')).resolves.toBe(4);
+  });
+
+  test('getID throws when no row matches', async () => {
+    const conn = createFakeConnection([[]]);
+    await expect(createTestDb(conn).getID(conn, 'name', 'nope', 'franchise')).rejects.toThrow('No ID found');
+  });
+});
+
+describe('database initialization', () => {
+  beforeEach(() => {
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  test('an existing database only ensures the schema and creates no default admin', async () => {
+    const conn = createFakeConnection([[{ SCHEMA_NAME: 'testdb' }]]);
+    const db = new DB({ connect: async () => conn, config: testConfig });
+    const addUser = jest.spyOn(db, 'addUser').mockResolvedValue({});
+
+    await db.init();
+
+    expect(conn.query).toHaveBeenCalledWith('CREATE DATABASE IF NOT EXISTS testdb');
+    expect(conn.query).toHaveBeenCalledWith('USE testdb');
+    expect(conn.query).toHaveBeenCalledTimes(2 + dbModel.tableCreateStatements.length);
+    expect(addUser).not.toHaveBeenCalled();
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('a new database also creates the default admin', async () => {
+    const conn = createFakeConnection([[]]);
+    const db = new DB({ connect: async () => conn, config: testConfig });
+    const addUser = jest.spyOn(db, 'addUser').mockResolvedValue({});
+
+    await db.init();
+
+    expect(addUser).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@jwt.com', roles: [{ role: 'admin' }] }));
+  });
+
+  test('init runs initialization only once', async () => {
+    const conn = createFakeConnection([[{ SCHEMA_NAME: 'testdb' }]]);
+    const connect = jest.fn(async () => conn);
+    const db = new DB({ connect, config: testConfig });
+
+    const first = db.init();
+    expect(db.init()).toBe(first);
+    await first;
+
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+});
