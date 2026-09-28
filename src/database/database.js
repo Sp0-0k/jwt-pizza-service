@@ -221,6 +221,11 @@ class DB {
   }
 
   async getFranchises(authUser, page = 0, limit = 10, nameFilter = '*') {
+    page = Number(page);
+    limit = Number(limit);
+    if (!Number.isInteger(page) || !Number.isInteger(limit) || page < 0 || limit < 1) {
+      throw new StatusCodeError('invalid paging parameters', 400);
+    }
     const connection = await this.getConnection();
 
     const offset = page * limit;
