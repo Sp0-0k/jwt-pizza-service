@@ -85,6 +85,9 @@ function createFranchiseRouter({ db, auth }) {
 
   // deleteFranchise
   async function deleteFranchise(req, res) {
+    if (!req.user?.isRole(Role.Admin)) {
+      throw new StatusCodeError('unable to delete a franchise', 403);
+    }
     const franchiseId = Number(req.params.franchiseId);
     await db.deleteFranchise(franchiseId);
     res.json({ message: 'franchise deleted' });
@@ -117,7 +120,7 @@ function createFranchiseRouter({ db, auth }) {
   router.get('/', asyncHandler(getFranchises));
   router.get('/:userId', auth.authenticateToken, asyncHandler(getUserFranchises));
   router.post('/', auth.authenticateToken, asyncHandler(createFranchise));
-  router.delete('/:franchiseId', asyncHandler(deleteFranchise));
+  router.delete('/:franchiseId', auth.authenticateToken, asyncHandler(deleteFranchise));
   router.post('/:franchiseId/store', auth.authenticateToken, asyncHandler(createStore));
   router.delete('/:franchiseId/store/:storeId', auth.authenticateToken, asyncHandler(deleteStore));
 
