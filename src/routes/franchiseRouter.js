@@ -1,11 +1,8 @@
 const express = require('express');
-const { DB, Role } = require('../database/database.js');
-const { authRouter } = require('./authRouter.js');
+const { Role } = require('../model/model.js');
 const { StatusCodeError, asyncHandler } = require('../endpointHelper.js');
 
-const franchiseRouter = express.Router();
-
-franchiseRouter.docs = [
+const docs = [
   {
     method: 'GET',
     path: '/api/franchise?page=0&limit=10&name=*',
@@ -55,84 +52,77 @@ franchiseRouter.docs = [
   },
 ];
 
-// getFranchises
-franchiseRouter.get(
-  '/',
-  asyncHandler(async (req, res) => {
-    const [franchises, more] = await DB.getFranchises(req.user, req.query.page, req.query.limit, req.query.name);
-    res.json({ franchises, more });
-  })
-);
+function createFranchiseRouter({ db, auth }) {
+  const router = express.Router();
+  router.docs = docs;
 
-// getUserFranchises
-franchiseRouter.get(
-  '/:userId',
-  authRouter.authenticateToken,
-  asyncHandler(async (req, res) => {
+  // getFranchises
+  async function getFranchises(req, res) {
+    const [franchises, more] = await db.getFranchises(req.user, req.query.page, req.query.limit, req.query.name);
+    res.json({ franchises, more });
+  }
+
+  // getUserFranchises
+  async function getUserFranchises(req, res) {
     let result = [];
     const userId = Number(req.params.userId);
     if (req.user.id === userId || req.user.isRole(Role.Admin)) {
-      result = await DB.getUserFranchises(userId);
+      result = await db.getUserFranchises(userId);
     }
 
     res.json(result);
-  })
-);
+  }
 
-// createFranchise
-franchiseRouter.post(
-  '/',
-  authRouter.authenticateToken,
-  asyncHandler(async (req, res) => {
+  // createFranchise
+  async function createFranchise(req, res) {
     if (!req.user.isRole(Role.Admin)) {
       throw new StatusCodeError('unable to create a franchise', 403);
     }
 
     const franchise = req.body;
-    res.send(await DB.createFranchise(franchise));
-  })
-);
+    res.send(await db.createFranchise(franchise));
+  }
 
-// deleteFranchise
-franchiseRouter.delete(
-  '/:franchiseId',
-  asyncHandler(async (req, res) => {
+  // deleteFranchise
+  async function deleteFranchise(req, res) {
     const franchiseId = Number(req.params.franchiseId);
-    await DB.deleteFranchise(franchiseId);
+    await db.deleteFranchise(franchiseId);
     res.json({ message: 'franchise deleted' });
-  })
-);
+  }
 
-// createStore
-franchiseRouter.post(
-  '/:franchiseId/store',
-  authRouter.authenticateToken,
-  asyncHandler(async (req, res) => {
+  // createStore
+  async function createStore(req, res) {
     const franchiseId = Number(req.params.franchiseId);
-    const franchise = await DB.getFranchise({ id: franchiseId });
+    const franchise = await db.getFranchise({ id: franchiseId });
     if (!franchise || (!req.user.isRole(Role.Admin) && !franchise.admins.some((admin) => admin.id === req.user.id))) {
       throw new StatusCodeError('unable to create a store', 403);
     }
 
-    res.send(await DB.createStore(franchise.id, req.body));
-  })
-);
+    res.send(await db.createStore(franchise.id, req.body));
+  }
 
-// deleteStore
-franchiseRouter.delete(
-  '/:franchiseId/store/:storeId',
-  authRouter.authenticateToken,
-  asyncHandler(async (req, res) => {
+  // deleteStore
+  async function deleteStore(req, res) {
     const franchiseId = Number(req.params.franchiseId);
-    const franchise = await DB.getFranchise({ id: franchiseId });
+    const franchise = await db.getFranchise({ id: franchiseId });
     if (!franchise || (!req.user.isRole(Role.Admin) && !franchise.admins.some((admin) => admin.id === req.user.id))) {
       throw new StatusCodeError('unable to delete a store', 403);
     }
 
     const storeId = Number(req.params.storeId);
-    await DB.deleteStore(franchiseId, storeId);
+    await db.deleteStore(franchiseId, storeId);
     res.json({ message: 'store deleted' });
-  })
-);
+  }
 
-module.exports = franchiseRouter;
+  router.get('/', asyncHandler(getFranchises));
+  router.get('/:userId', auth.authenticateToken, asyncHandler(getUserFranchises));
+  router.post('/', auth.authenticateToken, asyncHandler(createFranchise));
+  router.delete('/:franchiseId', asyncHandler(deleteFranchise));
+  router.post('/:franchiseId/store', auth.authenticateToken, asyncHandler(createStore));
+  router.delete('/:franchiseId/store/:storeId', auth.authenticateToken, asyncHandler(deleteStore));
+
+  router.handlers = { getFranchises, getUserFranchises, createFranchise, deleteFranchise, createStore, deleteStore };
+  return router;
+}
+
+module.exports = { createFranchiseRouter };
