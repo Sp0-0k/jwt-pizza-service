@@ -360,7 +360,7 @@ class DB {
         connection.end();
       }
     } catch (err) {
-      console.error(JSON.stringify({ message: 'Error initializing database', exception: err.message, connection: this.config.db.connection }));
+      console.error(JSON.stringify({ message: 'Error initializing database', exception: err.message, host: this.config.db.connection.host, database: this.config.db.connection.database }));
     }
   }
 
