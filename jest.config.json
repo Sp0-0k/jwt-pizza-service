@@ -1,5 +1,6 @@
 {
   "collectCoverage": true,
   "coverageReporters": ["json-summary", "text"],
-  "coveragePathIgnorePatterns": ["/node_modules/", "/tests/"]
+  "coveragePathIgnorePatterns": ["/node_modules/", "/tests/"],
+  "coverageThreshold": { "global": { "lines": 80 } }
 }
