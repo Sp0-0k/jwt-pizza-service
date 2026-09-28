@@ -96,6 +96,9 @@ function createAuthRouter({ db, auth }) {
   // login
   async function login(req, res) {
     const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ message: 'email and password are required' });
+    }
     const user = await db.getUser(email, password);
     const token = await auth.setAuth(user);
     res.json({ user: user, token: token });
