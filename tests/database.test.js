@@ -200,4 +200,190 @@ describe('token storage', () => {
 });
 
 // The helpers below are used by the describe blocks added in later tasks.
+describe('menu', () => {
+  test('getMenu returns the rows and closes the connection', async () => {
+    const rows = [{ id: 1, title: 'Veggie' }];
+    const conn = createFakeConnection([rows]);
+    await expect(createTestDb(conn).getMenu()).resolves.toEqual(rows);
+    expect(conn.query).toHaveBeenCalledWith('USE testdb');
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('getMenu closes the connection when the query fails', async () => {
+    const conn = createFakeConnection();
+    conn.execute.mockRejectedValueOnce(new Error('db down'));
+    await expect(createTestDb(conn).getMenu()).rejects.toThrow('db down');
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('addMenuItem inserts the item and returns it with its new id', async () => {
+    const conn = createFakeConnection([{ insertId: 6 }]);
+    const item = { title: 'Student', description: 'carbs', image: 'p.png', price: 0.0001 };
+    await expect(createTestDb(conn).addMenuItem(item)).resolves.toEqual({ ...item, id: 6 });
+    expect(conn.execute.mock.calls[0][1]).toEqual(['Student', 'carbs', 'p.png', 0.0001]);
+  });
+});
+
+describe('orders', () => {
+  test('getOrders defaults to the first page and attaches each order\'s items', async () => {
+    const conn = createFakeConnection([[{ id: 1 }, { id: 2 }], [{ id: 10 }], []]);
+
+    const result = await createTestDb(conn).getOrders({ id: 4 });
+
+    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 0,10');
+    expect(conn.execute.mock.calls[0][1]).toEqual([4]);
+    expect(result).toEqual({ dinerId: 4, page: 1, orders: [{ id: 1, items: [{ id: 10 }] }, { id: 2, items: [] }] });
+  });
+
+  test('getOrders offsets later pages', async () => {
+    const conn = createFakeConnection([[]]);
+    const result = await createTestDb(conn).getOrders({ id: 4 }, 3);
+    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 20,10');
+    expect(result).toEqual({ dinerId: 4, page: 3, orders: [] });
+  });
+
+  test('addDinerOrder writes the order and every item and returns the order with its id', async () => {
+    const conn = createFakeConnection([{ insertId: 50 }, [{ id: 1 }], {}, [{ id: 2 }], {}]);
+    const order = { franchiseId: 1, storeId: 2, items: [{ menuId: 1, description: 'Veggie', price: 0.05 }, { menuId: 2, description: 'Pepperoni', price: 0.06 }] };
+
+    const result = await createTestDb(conn).addDinerOrder({ id: 4 }, order);
+
+    expect(result).toEqual({ ...order, id: 50 });
+    expect(conn.execute.mock.calls[0][1]).toEqual([4, 1, 2]);
+    expect(conn.execute.mock.calls[2][1]).toEqual([50, 1, 'Veggie', 0.05]);
+    expect(conn.execute.mock.calls[4][1]).toEqual([50, 2, 'Pepperoni', 0.06]);
+  });
+
+  test('addDinerOrder fails for an unknown menu item and closes the connection', async () => {
+    const conn = createFakeConnection([{ insertId: 50 }, []]);
+    const order = { franchiseId: 1, storeId: 2, items: [{ menuId: 999, description: 'Ghost', price: 1 }] };
+    await expect(createTestDb(conn).addDinerOrder({ id: 4 }, order)).rejects.toThrow('No ID found');
+    expect(conn.end).toHaveBeenCalled();
+  });
+});
+
+describe('franchises', () => {
+  test('createFranchise resolves admins by email and grants each the franchisee role', async () => {
+    const conn = createFakeConnection([[{ id: 4, name: 'F' }], { insertId: 9 }, {}]);
+
+    const result = await createTestDb(conn).createFranchise({ name: 'pizzaPocket', admins: [{ email: 'f@test.com' }] });
+
+    expect(result).toEqual({ id: 9, name: 'pizzaPocket', admins: [{ email: 'f@test.com', id: 4, name: 'F' }] });
+    expect(conn.execute.mock.calls[2][1]).toEqual([4, 'franchisee', 9]);
+  });
+
+  test('createFranchise fails with 404 for an unknown admin before writing anything', async () => {
+    const conn = createFakeConnection([[]]);
+
+    await expect(createTestDb(conn).createFranchise({ name: 'pizzaPocket', admins: [{ email: 'ghost@test.com' }] })).rejects.toMatchObject({ statusCode: 404 });
+    expect(conn.execute).toHaveBeenCalledTimes(1);
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('deleteFranchise commits the transaction on success', async () => {
+    const conn = createFakeConnection([{}, {}, {}]);
+
+    await createTestDb(conn).deleteFranchise(3);
+
+    expect(conn.beginTransaction).toHaveBeenCalled();
+    expect(conn.commit).toHaveBeenCalled();
+    expect(conn.rollback).not.toHaveBeenCalled();
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('deleteFranchise rolls back and reports 500 when a statement fails', async () => {
+    const conn = createFakeConnection([{}]);
+    conn.execute.mockRejectedValueOnce(new Error('fk violation'));
+
+    await expect(createTestDb(conn).deleteFranchise(3)).rejects.toMatchObject({ statusCode: 500, message: 'unable to delete franchise' });
+
+    expect(conn.rollback).toHaveBeenCalled();
+    expect(conn.commit).not.toHaveBeenCalled();
+    expect(conn.end).toHaveBeenCalled();
+  });
+
+  test('getFranchises trims to the limit, reports more, and gives non-admins stores only', async () => {
+    const conn = createFakeConnection([[{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' }], [{ id: 11, name: 's1' }], [{ id: 12, name: 's2' }]]);
+
+    const [franchises, more] = await createTestDb(conn).getFranchises(undefined, 0, 2, 'p*');
+
+    expect(conn.execute.mock.calls[0][1]).toEqual(['p%']);
+    expect(more).toBe(true);
+    expect(franchises).toEqual([{ id: 1, name: 'a', stores: [{ id: 11, name: 's1' }] }, { id: 2, name: 'b', stores: [{ id: 12, name: 's2' }] }]);
+  });
+
+  test('getFranchises reports no more when the page is not full', async () => {
+    const conn = createFakeConnection([[{ id: 1, name: 'a' }], [{ id: 11, name: 's1' }]]);
+    const [franchises, more] = await createTestDb(conn).getFranchises(undefined, 0, 2);
+    expect(more).toBe(false);
+    expect(franchises).toHaveLength(1);
+  });
+
+  test('getFranchises loads full details for an admin caller', async () => {
+    const conn = createFakeConnection([[{ id: 1, name: 'a' }]]);
+    const db = createTestDb(conn);
+    const detail = jest.spyOn(db, 'getFranchise').mockImplementation(async (f) => Object.assign(f, { admins: [], stores: [] }));
+
+    await db.getFranchises(makeAdmin(1), 0, 10, '*');
+
+    expect(detail).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+  });
+
+  // BUG (SQL interpolation): req.query values are strings, so limit + 1 concatenates ('10' + 1 = '101')
+  // and the raw value is interpolated into the SQL.
+  test('treats a string limit from the query string as a number', async () => {
+    const conn = createFakeConnection([[]]);
+    await createTestDb(conn).getFranchises(undefined, '0', '10', '*');
+    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 11 OFFSET 0');
+  });
+
+  test('rejects a non-numeric limit with 400 before touching SQL', async () => {
+    const conn = createFakeConnection([[]]);
+    await expect(createTestDb(conn).getFranchises(undefined, 0, '1 UNION SELECT password FROM user', '*')).rejects.toMatchObject({ statusCode: 400 });
+    expect(conn.execute).not.toHaveBeenCalled();
+  });
+
+  test('getUserFranchises returns an empty list when the user administers none', async () => {
+    const conn = createFakeConnection([[]]);
+    await expect(createTestDb(conn).getUserFranchises(20)).resolves.toEqual([]);
+  });
+
+  test('getUserFranchises loads details for each franchise the user administers', async () => {
+    const conn = createFakeConnection([[{ objectId: 3 }], [{ id: 3, name: 'p' }]]);
+    const db = createTestDb(conn);
+    const detail = jest.spyOn(db, 'getFranchise').mockImplementation(async (f) => Object.assign(f, { admins: [], stores: [] }));
+
+    const result = await db.getUserFranchises(20);
+
+    expect(detail).toHaveBeenCalledTimes(1);
+    expect(result).toEqual([{ id: 3, name: 'p', admins: [], stores: [] }]);
+  });
+
+  test('getFranchise attaches admins and stores with revenue', async () => {
+    const admins = [{ id: 20, name: 'f', email: 'f@test.com' }];
+    const stores = [{ id: 8, name: 'SLC', totalRevenue: 1.5 }];
+    const conn = createFakeConnection([admins, stores]);
+
+    const result = await createTestDb(conn).getFranchise({ id: 3, name: 'p' });
+
+    expect(result).toEqual({ id: 3, name: 'p', admins, stores });
+    expect(conn.execute.mock.calls[0][1]).toEqual([3]);
+  });
+});
+
+describe('stores', () => {
+  test('createStore inserts under the franchise and returns the store', async () => {
+    const conn = createFakeConnection([{ insertId: 8 }]);
+    await expect(createTestDb(conn).createStore(3, { name: 'SLC' })).resolves.toEqual({ id: 8, franchiseId: 3, name: 'SLC' });
+    expect(conn.execute.mock.calls[0][1]).toEqual([3, 'SLC']);
+  });
+
+  test('deleteStore only deletes a store belonging to the franchise', async () => {
+    const conn = createFakeConnection([{}]);
+    await createTestDb(conn).deleteStore(3, 8);
+    expect(conn.execute.mock.calls[0][1]).toEqual([3, 8]);
+    expect(conn.execute.mock.calls[0][0]).toContain('franchiseId=?');
+  });
+});
+
 module.exports = { testConfig, createFakeConnection, createTestDb, StatusCodeError, dbModel, makeAdmin };
