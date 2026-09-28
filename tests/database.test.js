@@ -159,6 +159,7 @@ describe('updateUser', () => {
 
     expect(user).toMatchObject({ id: 7, name: 'New', email: 'e@test.com', roles: [{ role: 'diner' }] });
     expect(user.password).toBeUndefined();
+    expect(conn.execute.mock.calls[1]).toEqual([expect.stringContaining('WHERE id=?'), [7]]);
     expect(conn.end).toHaveBeenCalled();
   });
 
