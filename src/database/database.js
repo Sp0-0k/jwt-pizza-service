@@ -68,16 +68,11 @@ class DB {
     try {
       const userResult = await this.query(connection, `SELECT * FROM user WHERE email=?`, [email]);
       const user = userResult[0];
-      if (!user || (password && !(await bcrypt.compare(password, user.password)))) {
+      if (!user || !password || !(await bcrypt.compare(password, user.password))) {
         throw new StatusCodeError('unknown user', 404);
       }
 
-      const roleResult = await this.query(connection, `SELECT * FROM userRole WHERE userId=?`, [user.id]);
-      const roles = roleResult.map((r) => {
-        return { objectId: r.objectId || undefined, role: r.role };
-      });
-
-      return { ...user, roles: roles, password: undefined };
+      return this.attachRoles(connection, user);
     } finally {
       connection.end();
     }
@@ -86,25 +81,39 @@ class DB {
   async updateUser(userId, name, email, password) {
     const connection = await this.getConnection();
     try {
+      const assignments = [];
       const params = [];
       if (password) {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        params.push(`password='${hashedPassword}'`);
+        assignments.push('password=?');
+        params.push(await bcrypt.hash(password, 10));
       }
       if (email) {
-        params.push(`email='${email}'`);
+        assignments.push('email=?');
+        params.push(email);
       }
       if (name) {
-        params.push(`name='${name}'`);
+        assignments.push('name=?');
+        params.push(name);
       }
-      if (params.length > 0) {
-        const query = `UPDATE user SET ${params.join(', ')} WHERE id=${userId}`;
-        await this.query(connection, query);
+      if (assignments.length > 0) {
+        await this.query(connection, `UPDATE user SET ${assignments.join(', ')} WHERE id=?`, [...params, userId]);
       }
-      return this.getUser(email, password);
+      const userResult = await this.query(connection, `SELECT * FROM user WHERE id=?`, [userId]);
+      if (!userResult[0]) {
+        throw new StatusCodeError('unknown user', 404);
+      }
+      return this.attachRoles(connection, userResult[0]);
     } finally {
       connection.end();
     }
+  }
+
+  async attachRoles(connection, user) {
+    const roleResult = await this.query(connection, `SELECT * FROM userRole WHERE userId=?`, [user.id]);
+    const roles = roleResult.map((r) => {
+      return { objectId: r.objectId || undefined, role: r.role };
+    });
+    return { ...user, roles: roles, password: undefined };
   }
 
   async loginUser(userId, token) {
@@ -212,6 +221,11 @@ class DB {
   }
 
   async getFranchises(authUser, page = 0, limit = 10, nameFilter = '*') {
+    page = Number(page);
+    limit = Number(limit);
+    if (!Number.isInteger(page) || !Number.isInteger(limit) || page < 0 || limit < 1) {
+      throw new StatusCodeError('invalid paging parameters', 400);
+    }
     const connection = await this.getConnection();
 
     const offset = page * limit;
@@ -360,7 +374,7 @@ class DB {
         connection.end();
       }
     } catch (err) {
-      console.error(JSON.stringify({ message: 'Error initializing database', exception: err.message, connection: this.config.db.connection }));
+      console.error(JSON.stringify({ message: 'Error initializing database', exception: err.message, host: this.config.db.connection.host, database: this.config.db.connection.database }));
     }
   }
 
