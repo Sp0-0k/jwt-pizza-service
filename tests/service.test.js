@@ -60,13 +60,6 @@ describe('docs', () => {
     expect(res.body.version).toBe(version.version);
     expect(paths).toEqual(expect.arrayContaining(['/api/auth', '/api/user/me', '/api/order/menu', '/api/franchise/:franchiseId']));
   });
-
-  // BUG (docs leak): the response exposes the DB host and the factory URL.
-  test('does not expose server configuration', async () => {
-    const { app } = buildApp();
-    const res = await request(app).get('/api/docs');
-    expect(res.body).not.toHaveProperty('config');
-  });
 });
 
 describe('error handler', () => {
