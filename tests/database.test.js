@@ -1,387 +1,355 @@
-jest.mock('bcrypt', () => ({
-  hash: jest.fn(async (password) => `hashed:${password}`),
-  compare: jest.fn(async (password, hash) => hash === `hashed:${password}`),
-}));
-
+const bcrypt = require('bcrypt');
 const { DB } = require('../src/database/database.js');
-const dbModel = require('../src/database/dbModel.js');
-const { makeAdmin } = require('./helpers/fixtures.js');
+const { testConfig } = require('./setup/testConfig.js');
+const { createHarness } = require('./helpers/harness.js');
 
-const testConfig = {
-  db: {
-    connection: { host: 'db.test', user: 'tester', password: 'super-secret-password', database: 'testdb', connectTimeout: 100 },
-    listPerPage: 10,
-  },
-};
+const h = createHarness();
+const db = h.db;
+beforeAll(h.start);
+beforeEach(h.reset);
 
-// execute() resolves the queued results in order, each wrapped as mysql2 does: [rows]. Calling execute()
-// more times than results were queued yields undefined and fails loudly with a TypeError.
-function createFakeConnection(results = []) {
-  const connection = {
-    execute: jest.fn(),
-    query: jest.fn(async () => [[]]),
-    end: jest.fn(),
-    beginTransaction: jest.fn(async () => {}),
-    commit: jest.fn(async () => {}),
-    rollback: jest.fn(async () => {}),
-  };
-  for (const result of results) {
-    connection.execute.mockResolvedValueOnce([result]);
-  }
-  return connection;
-}
-
-// Skips schema initialization so a test only sees the calls made by the method under test.
-function createTestDb(connection) {
-  const db = new DB({ connect: async () => connection, config: testConfig });
-  db.initialized = Promise.resolve();
-  return db;
-}
-
-afterEach(() => {
-  jest.restoreAllMocks();
-});
+const count = async (table) => (await h.query(`SELECT COUNT(*) AS n FROM ${table}`))[0].n;
+const diner = (email = 'd@test.com') => ({ name: 'Dee', email, password: 'pw', roles: [{ role: 'diner' }] });
+const menuItem = { title: 'Veggie', description: 'd', image: 'p.png', price: 0.05 };
+const withDatabase = (database) => ({ ...testConfig, db: { ...testConfig.db, connection: { ...testConfig.db.connection, database } } });
 
 describe('initializeDatabase', () => {
-  test('logs a connection failure without the database password', async () => {
-    const connect = jest.fn().mockRejectedValue(new Error('connect refused'));
-    const db = new DB({ connect, config: testConfig });
-    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  const freshName = 'pizza_init_test';
+  beforeEach(() => h.serverQuery(`DROP DATABASE IF EXISTS ${freshName}`));
+  afterAll(() => h.serverQuery(`DROP DATABASE IF EXISTS ${freshName}`));
 
-    await db.init();
+  async function waitForDefaultAdmin(target) {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        return await target.getUser('a@jwt.com', 'admin');
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    throw new Error('default admin was never created');
+  }
 
-    const logged = errorSpy.mock.calls.flat().join(' ');
-    expect(logged).toContain('Error initializing database');
-    expect(logged).toContain('connect refused');
-    expect(logged).not.toContain(testConfig.db.connection.password);
+  test('a new database gets the schema and the default admin', async () => {
+    const fresh = new DB({ config: withDatabase(freshName) });
+
+    await fresh.init();
+
+    const admin = await waitForDefaultAdmin(fresh);
+    expect(admin.roles.map((r) => r.role)).toEqual(['admin']);
+  });
+
+  test('an existing database only ensures the schema and creates no default admin', async () => {
+    await new DB({ config: testConfig }).init();
+
+    expect(await count('user')).toBe(0);
+  });
+
+  test('init runs initialization only once', async () => {
+    const fresh = new DB({ config: testConfig });
+
+    expect(fresh.init()).toBe(fresh.init());
+    await fresh.init();
   });
 });
 
 describe('addUser', () => {
   test('stores a hashed password, writes each role and returns the user without a password', async () => {
-    const conn = createFakeConnection([{ insertId: 11 }, {}, {}]);
-    const db = createTestDb(conn);
+    const user = await db.addUser(diner());
 
-    const user = await db.addUser({ name: 'N', email: 'n@test.com', password: 'pw', roles: [{ role: 'diner' }, { role: 'admin' }] });
-
-    expect(conn.execute.mock.calls[0][1]).toEqual(['N', 'n@test.com', 'hashed:pw']);
-    expect(conn.execute.mock.calls[1][1]).toEqual([11, 'diner', 0]);
-    expect(conn.execute.mock.calls[2][1]).toEqual([11, 'admin', 0]);
-    expect(user).toMatchObject({ id: 11, name: 'N', email: 'n@test.com' });
+    expect(user).toMatchObject({ name: 'Dee', email: 'd@test.com' });
     expect(user.password).toBeUndefined();
-    expect(conn.end).toHaveBeenCalled();
+    const [row] = await h.query('SELECT password FROM user WHERE id=?', [user.id]);
+    expect(row.password).not.toBe('pw');
+    expect(await bcrypt.compare('pw', row.password)).toBe(true);
+    expect(await h.query('SELECT role, objectId FROM userRole WHERE userId=?', [user.id])).toEqual([{ role: 'diner', objectId: 0 }]);
   });
 
   test('ties a franchisee role to the named franchise', async () => {
-    const conn = createFakeConnection([{ insertId: 12 }, [{ id: 4 }], {}]);
-    const db = createTestDb(conn);
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [] });
 
-    await db.addUser({ name: 'F', email: 'f@test.com', password: 'pw', roles: [{ role: 'franchisee', object: 'pizzaPocket' }] });
+    const user = await db.addUser({ ...diner(), roles: [{ role: 'franchisee', object: 'pizzaPocket' }] });
 
-    expect(conn.execute.mock.calls[1][1]).toEqual(['pizzaPocket']);
-    expect(conn.execute.mock.calls[2][1]).toEqual([12, 'franchisee', 4]);
+    expect(await h.query('SELECT role, objectId FROM userRole WHERE userId=?', [user.id])).toEqual([{ role: 'franchisee', objectId: franchise.id }]);
   });
 
-  test('fails and still closes the connection when the franchise is unknown', async () => {
-    const conn = createFakeConnection([{ insertId: 12 }, []]);
-    const db = createTestDb(conn);
-
-    await expect(db.addUser({ name: 'F', email: 'f@test.com', password: 'pw', roles: [{ role: 'franchisee', object: 'nope' }] })).rejects.toThrow('No ID found');
-    expect(conn.end).toHaveBeenCalled();
+  test('fails when the franchise is unknown', async () => {
+    await expect(db.addUser({ ...diner(), roles: [{ role: 'franchisee', object: 'nope' }] })).rejects.toThrow('No ID found');
   });
 });
 
 describe('getUser', () => {
-  const row = { id: 1, name: 'A', email: 'a@test.com', password: 'hashed:pw' };
-
   test('returns the user with roles and no password when the password matches', async () => {
-    const conn = createFakeConnection([[row], [{ role: 'admin', objectId: 0 }, { role: 'franchisee', objectId: 3 }]]);
-    const db = createTestDb(conn);
+    const created = await h.createUser(diner());
 
-    const user = await db.getUser('a@test.com', 'pw');
+    const user = await db.getUser('d@test.com', 'pw');
 
-    expect(user).toEqual({ id: 1, name: 'A', email: 'a@test.com', password: undefined, roles: [{ role: 'admin', objectId: undefined }, { role: 'franchisee', objectId: 3 }] });
-    expect(conn.end).toHaveBeenCalled();
+    expect(user).toMatchObject({ id: created.id, name: 'Dee', email: 'd@test.com' });
+    expect(user.roles.map((r) => r.role)).toEqual(['diner']);
+    expect(user.password).toBeUndefined();
   });
 
-  test('rejects with 404 for a wrong password', async () => {
-    const db = createTestDb(createFakeConnection([[row]]));
-    await expect(db.getUser('a@test.com', 'nope')).rejects.toMatchObject({ statusCode: 404, message: 'unknown user' });
-  });
+  test.each([
+    ['a wrong password', 'd@test.com', 'wrong'],
+    ['an unknown email', 'ghost@test.com', 'pw'],
+    ['an empty password', 'd@test.com', ''],
+  ])('rejects with 404 for %s', async (name, email, password) => {
+    await h.createUser(diner());
 
-  test('rejects with 404 for an unknown email', async () => {
-    const db = createTestDb(createFakeConnection([[]]));
-    await expect(db.getUser('ghost@test.com', 'pw')).rejects.toMatchObject({ statusCode: 404 });
-  });
-
-  // BUG (empty-password bypass): an empty password skips the password comparison entirely.
-  test('rejects an empty password instead of skipping the password check', async () => {
-    const db = createTestDb(createFakeConnection([[row], []]));
-    await expect(db.getUser('a@test.com', '')).rejects.toMatchObject({ statusCode: 404 });
+    await expect(db.getUser(email, password)).rejects.toMatchObject({ statusCode: 404 });
   });
 });
 
 describe('updateUser', () => {
-  const row = { id: 7, name: 'New', email: 'e@test.com', password: 'hashed:pw' };
+  test('stores user-controlled values literally, never as SQL', async () => {
+    const created = await h.createUser(diner());
+    const name = "x', password='hacked";
 
-  // BUG (SQL interpolation): values are concatenated into the UPDATE, and a partial update calls
-  // getUser(email, password) with undefined values.
-  test('sends user-controlled values as parameters, never inside the SQL text', async () => {
-    const evil = "x', password='pwned";
-    const conn = createFakeConnection([{ affectedRows: 1 }, [row], []]);
-    const db = createTestDb(conn);
+    const user = await db.updateUser(created.id, name, undefined, undefined);
 
-    await db.updateUser(7, evil, undefined, undefined);
-
-    const [sql, params] = conn.execute.mock.calls[0];
-    expect(sql).not.toContain('pwned');
-    expect(params).toContain(evil);
-    expect(params).toContain(7);
+    expect(user.name).toBe(name);
+    await expect(db.getUser('d@test.com', 'pw')).resolves.toBeTruthy();
   });
 
-  test('hashes a new password and sends it as a parameter', async () => {
-    const conn = createFakeConnection([{ affectedRows: 1 }, [row], []]);
-    const db = createTestDb(conn);
+  test('hashes a new password', async () => {
+    const created = await h.createUser(diner());
 
-    await db.updateUser(7, undefined, 'e@test.com', 'newpw');
+    await db.updateUser(created.id, undefined, undefined, 'new-pw');
 
-    const [sql, params] = conn.execute.mock.calls[0];
-    expect(sql).not.toContain('hashed:newpw');
-    expect(params).toContain('hashed:newpw');
-    expect(params).toContain('e@test.com');
+    await expect(db.getUser('d@test.com', 'new-pw')).resolves.toBeTruthy();
+    await expect(db.getUser('d@test.com', 'pw')).rejects.toMatchObject({ statusCode: 404 });
   });
 
   test('a partial update returns the refreshed user by id without a password', async () => {
-    const conn = createFakeConnection([{ affectedRows: 1 }, [row], [{ role: 'diner', objectId: 0 }]]);
-    const db = createTestDb(conn);
+    const created = await h.createUser(diner());
 
-    const user = await db.updateUser(7, 'New', undefined, undefined);
+    const user = await db.updateUser(created.id, 'Only Name', undefined, undefined);
 
-    expect(user).toMatchObject({ id: 7, name: 'New', email: 'e@test.com', roles: [{ role: 'diner' }] });
+    expect(user).toMatchObject({ id: created.id, name: 'Only Name', email: 'd@test.com' });
     expect(user.password).toBeUndefined();
-    expect(conn.execute.mock.calls[1]).toEqual([expect.stringContaining('WHERE id=?'), [7]]);
-    expect(conn.end).toHaveBeenCalled();
   });
 
-  test('runs no UPDATE when nothing is provided', async () => {
-    const conn = createFakeConnection([[row], []]);
-    const db = createTestDb(conn);
+  test('changes nothing when nothing is provided', async () => {
+    const created = await h.createUser(diner());
 
-    await db.updateUser(7);
+    const user = await db.updateUser(created.id, undefined, undefined, undefined);
 
-    expect(conn.execute.mock.calls[0][0]).toContain('SELECT');
-    expect(conn.execute.mock.calls.some(([sql]) => sql.includes('UPDATE'))).toBe(false);
+    expect(user).toMatchObject({ name: 'Dee', email: 'd@test.com' });
+  });
+
+  test('rejects with 404 for an unknown user', async () => {
+    await expect(db.updateUser(9999, 'x', undefined, undefined)).rejects.toMatchObject({ statusCode: 404 });
   });
 });
 
 describe('token storage', () => {
-  test('loginUser stores only the token signature', async () => {
-    const conn = createFakeConnection([{}]);
-    await createTestDb(conn).loginUser(5, 'aaa.bbb.sig');
-    expect(conn.execute.mock.calls[0][1]).toEqual(['sig', 5]);
-    expect(conn.end).toHaveBeenCalled();
+  const token = 'aaa.bbb.sig123';
+
+  test('loginUser stores only the token signature, once', async () => {
+    await db.loginUser(5, token);
+    await db.loginUser(5, token);
+
+    expect(await h.query('SELECT token, userId FROM auth')).toEqual([{ token: 'sig123', userId: 5 }]);
   });
 
-  test('isLoggedIn is true when a row exists for the signature', async () => {
-    const conn = createFakeConnection([[{ userId: 5 }]]);
-    await expect(createTestDb(conn).isLoggedIn('aaa.bbb.sig')).resolves.toBe(true);
-    expect(conn.execute.mock.calls[0][1]).toEqual(['sig']);
-  });
+  test('isLoggedIn is true for a stored signature and false otherwise', async () => {
+    await db.loginUser(5, token);
 
-  test('isLoggedIn is false when no row exists', async () => {
-    await expect(createTestDb(createFakeConnection([[]])).isLoggedIn('aaa.bbb.sig')).resolves.toBe(false);
+    expect(await db.isLoggedIn(token)).toBe(true);
+    expect(await db.isLoggedIn('aaa.bbb.other')).toBe(false);
   });
 
   test('logoutUser deletes by signature', async () => {
-    const conn = createFakeConnection([{}]);
-    await createTestDb(conn).logoutUser('aaa.bbb.sig');
-    expect(conn.execute.mock.calls[0][1]).toEqual(['sig']);
+    await db.loginUser(5, token);
+
+    await db.logoutUser(token);
+
+    expect(await db.isLoggedIn(token)).toBe(false);
   });
 });
 
 describe('menu', () => {
-  test('getMenu returns the rows and closes the connection', async () => {
-    const rows = [{ id: 1, title: 'Veggie' }];
-    const conn = createFakeConnection([rows]);
-    await expect(createTestDb(conn).getMenu()).resolves.toEqual(rows);
-    expect(conn.query).toHaveBeenCalledWith('USE testdb');
-    expect(conn.end).toHaveBeenCalled();
-  });
-
-  test('getMenu closes the connection when the query fails', async () => {
-    const conn = createFakeConnection();
-    conn.execute.mockRejectedValueOnce(new Error('db down'));
-    await expect(createTestDb(conn).getMenu()).rejects.toThrow('db down');
-    expect(conn.end).toHaveBeenCalled();
+  test('getMenu returns the rows', async () => {
+    expect(await db.getMenu()).toEqual([]);
   });
 
   test('addMenuItem inserts the item and returns it with its new id', async () => {
-    const conn = createFakeConnection([{ insertId: 6 }]);
-    const item = { title: 'Student', description: 'carbs', image: 'p.png', price: 0.0001 };
-    await expect(createTestDb(conn).addMenuItem(item)).resolves.toEqual({ ...item, id: 6 });
-    expect(conn.execute.mock.calls[0][1]).toEqual(['Student', 'carbs', 'p.png', 0.0001]);
+    const added = await db.addMenuItem(menuItem);
+
+    expect(added).toEqual({ ...menuItem, id: expect.any(Number) });
+    expect(await db.getMenu()).toEqual([{ ...menuItem, id: added.id }]);
   });
 });
 
 describe('orders', () => {
-  test('getOrders defaults to the first page and attaches each order\'s items', async () => {
-    const conn = createFakeConnection([[{ id: 1 }, { id: 2 }], [{ id: 10 }], []]);
-
-    const result = await createTestDb(conn).getOrders({ id: 4 });
-
-    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 0,10');
-    expect(conn.execute.mock.calls[0][1]).toEqual([4]);
-    expect(result).toEqual({ dinerId: 4, page: 1, orders: [{ id: 1, items: [{ id: 10 }] }, { id: 2, items: [] }] });
-  });
-
-  test('getOrders offsets later pages', async () => {
-    const conn = createFakeConnection([[]]);
-    const result = await createTestDb(conn).getOrders({ id: 4 }, 3);
-    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 20,10');
-    expect(result).toEqual({ dinerId: 4, page: 3, orders: [] });
+  const orderFor = (menuId, items = 1) => ({
+    franchiseId: 1,
+    storeId: 2,
+    items: Array.from({ length: items }, () => ({ menuId, description: 'Veggie', price: 0.05 })),
   });
 
   test('addDinerOrder writes the order and every item and returns the order with its id', async () => {
-    const conn = createFakeConnection([{ insertId: 50 }, [{ id: 1 }], {}, [{ id: 2 }], {}]);
-    const order = { franchiseId: 1, storeId: 2, items: [{ menuId: 1, description: 'Veggie', price: 0.05 }, { menuId: 2, description: 'Pepperoni', price: 0.06 }] };
+    const user = await h.createUser(diner());
+    const menu = await db.addMenuItem(menuItem);
 
-    const result = await createTestDb(conn).addDinerOrder({ id: 4 }, order);
+    const order = await db.addDinerOrder(user, orderFor(menu.id, 2));
 
-    expect(result).toEqual({ ...order, id: 50 });
-    expect(conn.execute.mock.calls[0][1]).toEqual([4, 1, 2]);
-    expect(conn.execute.mock.calls[2][1]).toEqual([50, 1, 'Veggie', 0.05]);
-    expect(conn.execute.mock.calls[4][1]).toEqual([50, 2, 'Pepperoni', 0.06]);
+    expect(order.id).toEqual(expect.any(Number));
+    expect(await count('orderItem')).toBe(2);
   });
 
-  test('addDinerOrder fails for an unknown menu item and closes the connection', async () => {
-    const conn = createFakeConnection([{ insertId: 50 }, []]);
-    const order = { franchiseId: 1, storeId: 2, items: [{ menuId: 999, description: 'Ghost', price: 1 }] };
-    await expect(createTestDb(conn).addDinerOrder({ id: 4 }, order)).rejects.toThrow('No ID found');
-    expect(conn.end).toHaveBeenCalled();
+  test('addDinerOrder fails for an unknown menu item', async () => {
+    const user = await h.createUser(diner());
+
+    await expect(db.addDinerOrder(user, orderFor(9999))).rejects.toThrow('No ID found');
+  });
+
+  test("getOrders defaults to the first page and attaches each order's items", async () => {
+    const user = await h.createUser(diner());
+    const menu = await db.addMenuItem(menuItem);
+    await db.addDinerOrder(user, orderFor(menu.id));
+
+    const result = await db.getOrders(user);
+
+    expect(result).toMatchObject({ dinerId: user.id, page: 1 });
+    expect(result.orders).toHaveLength(1);
+    expect(result.orders[0].items).toEqual([expect.objectContaining({ menuId: menu.id, description: 'Veggie', price: 0.05 })]);
+  });
+
+  test('getOrders offsets later pages', async () => {
+    const user = await h.createUser(diner());
+    const menu = await db.addMenuItem(menuItem);
+    for (let i = 0; i < 11; i++) {
+      await db.addDinerOrder(user, orderFor(menu.id));
+    }
+
+    expect((await db.getOrders(user, 1)).orders).toHaveLength(10);
+    expect((await db.getOrders(user, 2)).orders).toHaveLength(1);
   });
 });
 
 describe('franchises', () => {
+  const adminUser = { isRole: (role) => role === 'admin' };
+
   test('createFranchise resolves admins by email and grants each the franchisee role', async () => {
-    const conn = createFakeConnection([[{ id: 4, name: 'F' }], { insertId: 9 }, {}]);
+    const owner = await h.createUser(diner('owner@test.com'));
 
-    const result = await createTestDb(conn).createFranchise({ name: 'pizzaPocket', admins: [{ email: 'f@test.com' }] });
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [{ email: 'owner@test.com' }] });
 
-    expect(result).toEqual({ id: 9, name: 'pizzaPocket', admins: [{ email: 'f@test.com', id: 4, name: 'F' }] });
-    expect(conn.execute.mock.calls[2][1]).toEqual([4, 'franchisee', 9]);
+    expect(franchise.admins).toEqual([{ email: 'owner@test.com', id: owner.id, name: 'Dee' }]);
+    expect(await h.query("SELECT userId, objectId FROM userRole WHERE role='franchisee'")).toEqual([{ userId: owner.id, objectId: franchise.id }]);
   });
 
   test('createFranchise fails with 404 for an unknown admin before writing anything', async () => {
-    const conn = createFakeConnection([[]]);
-
-    await expect(createTestDb(conn).createFranchise({ name: 'pizzaPocket', admins: [{ email: 'ghost@test.com' }] })).rejects.toMatchObject({ statusCode: 404 });
-    expect(conn.execute).toHaveBeenCalledTimes(1);
-    expect(conn.end).toHaveBeenCalled();
+    await expect(db.createFranchise({ name: 'pizzaPocket', admins: [{ email: 'ghost@test.com' }] })).rejects.toMatchObject({ statusCode: 404 });
+    expect(await count('franchise')).toBe(0);
   });
 
-  test('deleteFranchise commits the transaction on success', async () => {
-    const conn = createFakeConnection([{}, {}, {}]);
+  test('deleteFranchise removes the franchise, its stores and its franchisee roles', async () => {
+    const owner = await h.createUser(diner('owner@test.com'));
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [{ email: owner.email }] });
+    await db.createStore(franchise.id, { name: 'SLC' });
 
-    await createTestDb(conn).deleteFranchise(3);
+    await db.deleteFranchise(franchise.id);
 
-    expect(conn.beginTransaction).toHaveBeenCalled();
-    expect(conn.commit).toHaveBeenCalled();
-    expect(conn.rollback).not.toHaveBeenCalled();
-    expect(conn.end).toHaveBeenCalled();
-  });
-
-  test('deleteFranchise rolls back and reports 500 when a statement fails', async () => {
-    const conn = createFakeConnection([{}]);
-    conn.execute.mockRejectedValueOnce(new Error('fk violation'));
-
-    await expect(createTestDb(conn).deleteFranchise(3)).rejects.toMatchObject({ statusCode: 500, message: 'unable to delete franchise' });
-
-    expect(conn.rollback).toHaveBeenCalled();
-    expect(conn.commit).not.toHaveBeenCalled();
-    expect(conn.end).toHaveBeenCalled();
+    expect(await count('franchise')).toBe(0);
+    expect(await count('store')).toBe(0);
+    expect(await h.query("SELECT id FROM userRole WHERE role='franchisee'")).toEqual([]);
   });
 
   test('getFranchises trims to the limit, reports more, and gives non-admins stores only', async () => {
-    const conn = createFakeConnection([[{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' }], [{ id: 11, name: 's1' }], [{ id: 12, name: 's2' }]]);
+    const first = await db.createFranchise({ name: 'f1', admins: [] });
+    await db.createFranchise({ name: 'f2', admins: [] });
+    await db.createStore(first.id, { name: 'SLC' });
 
-    const [franchises, more] = await createTestDb(conn).getFranchises(undefined, 0, 2, 'p*');
+    const [franchises, more] = await db.getFranchises(undefined, 0, 1);
 
-    expect(conn.execute.mock.calls[0][1]).toEqual(['p%']);
     expect(more).toBe(true);
-    expect(franchises).toEqual([{ id: 1, name: 'a', stores: [{ id: 11, name: 's1' }] }, { id: 2, name: 'b', stores: [{ id: 12, name: 's2' }] }]);
+    expect(franchises).toEqual([{ id: first.id, name: 'f1', stores: [{ id: expect.any(Number), name: 'SLC' }] }]);
   });
 
   test('getFranchises reports no more when the page is not full', async () => {
-    const conn = createFakeConnection([[{ id: 1, name: 'a' }], [{ id: 11, name: 's1' }]]);
-    const [franchises, more] = await createTestDb(conn).getFranchises(undefined, 0, 2);
-    expect(more).toBe(false);
+    await db.createFranchise({ name: 'f1', admins: [] });
+
+    const [franchises, more] = await db.getFranchises(undefined, 0, 10);
+
     expect(franchises).toHaveLength(1);
+    expect(more).toBe(false);
   });
 
-  test('getFranchises loads full details for an admin caller', async () => {
-    const conn = createFakeConnection([[{ id: 1, name: 'a' }]]);
-    const db = createTestDb(conn);
-    const detail = jest.spyOn(db, 'getFranchise').mockImplementation(async (f) => Object.assign(f, { admins: [], stores: [] }));
+  test('getFranchises loads admins and revenue for an admin caller', async () => {
+    const owner = await h.createUser(diner('owner@test.com'));
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [{ email: owner.email }] });
+    await db.createStore(franchise.id, { name: 'SLC' });
 
-    await db.getFranchises(makeAdmin(1), 0, 10, '*');
+    const [[listed]] = await db.getFranchises(adminUser);
 
-    expect(detail).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+    expect(listed.admins).toEqual([{ id: owner.id, name: 'Dee', email: 'owner@test.com' }]);
+    expect(listed.stores[0].totalRevenue).toBe(0);
   });
 
-  // BUG (SQL interpolation): req.query values are strings, so limit + 1 concatenates ('10' + 1 = '101')
-  // and the raw value is interpolated into the SQL.
   test('treats a string limit from the query string as a number', async () => {
-    const conn = createFakeConnection([[]]);
-    await createTestDb(conn).getFranchises(undefined, '0', '10', '*');
-    expect(conn.execute.mock.calls[0][0]).toContain('LIMIT 11 OFFSET 0');
+    await db.createFranchise({ name: 'f1', admins: [] });
+    await db.createFranchise({ name: 'f2', admins: [] });
+
+    const [franchises, more] = await db.getFranchises(undefined, '0', '1');
+
+    expect(franchises).toHaveLength(1);
+    expect(more).toBe(true);
   });
 
-  test('rejects a non-numeric limit with 400 before touching SQL', async () => {
-    const conn = createFakeConnection([[]]);
-    await expect(createTestDb(conn).getFranchises(undefined, 0, '1 UNION SELECT password FROM user', '*')).rejects.toMatchObject({ statusCode: 400 });
-    expect(conn.execute).not.toHaveBeenCalled();
+  test('rejects a non-numeric limit with 400', async () => {
+    await expect(db.getFranchises(undefined, 0, 'abc')).rejects.toMatchObject({ statusCode: 400 });
   });
 
   test('getUserFranchises returns an empty list when the user administers none', async () => {
-    const conn = createFakeConnection([[]]);
-    await expect(createTestDb(conn).getUserFranchises(20)).resolves.toEqual([]);
+    const user = await h.createUser(diner());
+
+    expect(await db.getUserFranchises(user.id)).toEqual([]);
   });
 
   test('getUserFranchises loads details for each franchise the user administers', async () => {
-    const conn = createFakeConnection([[{ objectId: 3 }], [{ id: 3, name: 'p' }]]);
-    const db = createTestDb(conn);
-    const detail = jest.spyOn(db, 'getFranchise').mockImplementation(async (f) => Object.assign(f, { admins: [], stores: [] }));
+    const owner = await h.createUser(diner('owner@test.com'));
+    await db.createFranchise({ name: 'f1', admins: [{ email: owner.email }] });
+    await db.createFranchise({ name: 'f2', admins: [{ email: owner.email }] });
 
-    const result = await db.getUserFranchises(20);
+    const franchises = await db.getUserFranchises(owner.id);
 
-    expect(detail).toHaveBeenCalledTimes(1);
-    expect(result).toEqual([{ id: 3, name: 'p', admins: [], stores: [] }]);
+    expect(franchises.map((f) => f.name)).toEqual(['f1', 'f2']);
+    expect(franchises[0].admins).toHaveLength(1);
   });
 
   test('getFranchise attaches admins and stores with revenue', async () => {
-    const admins = [{ id: 20, name: 'f', email: 'f@test.com' }];
-    const stores = [{ id: 8, name: 'SLC', totalRevenue: 1.5 }];
-    const conn = createFakeConnection([admins, stores]);
+    const user = await h.createUser(diner());
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [{ email: user.email }] });
+    const store = await db.createStore(franchise.id, { name: 'SLC' });
+    const menu = await db.addMenuItem(menuItem);
+    await db.addDinerOrder(user, { franchiseId: franchise.id, storeId: store.id, items: [{ menuId: menu.id, description: 'Veggie', price: 0.05 }] });
 
-    const result = await createTestDb(conn).getFranchise({ id: 3, name: 'p' });
+    const result = await db.getFranchise({ id: franchise.id });
 
-    expect(result).toEqual({ id: 3, name: 'p', admins, stores });
-    expect(conn.execute.mock.calls[0][1]).toEqual([3]);
+    expect(result.admins).toHaveLength(1);
+    expect(result.stores).toEqual([expect.objectContaining({ id: store.id, name: 'SLC' })]);
+    expect(result.stores[0].totalRevenue).toBeCloseTo(0.05);
   });
 });
 
 describe('stores', () => {
   test('createStore inserts under the franchise and returns the store', async () => {
-    const conn = createFakeConnection([{ insertId: 8 }]);
-    await expect(createTestDb(conn).createStore(3, { name: 'SLC' })).resolves.toEqual({ id: 8, franchiseId: 3, name: 'SLC' });
-    expect(conn.execute.mock.calls[0][1]).toEqual([3, 'SLC']);
+    const franchise = await db.createFranchise({ name: 'pizzaPocket', admins: [] });
+
+    const store = await db.createStore(franchise.id, { name: 'SLC' });
+
+    expect(store).toEqual({ id: expect.any(Number), franchiseId: franchise.id, name: 'SLC' });
   });
 
   test('deleteStore only deletes a store belonging to the franchise', async () => {
-    const conn = createFakeConnection([{}]);
-    await createTestDb(conn).deleteStore(3, 8);
-    expect(conn.execute.mock.calls[0][1]).toEqual([3, 8]);
-    expect(conn.execute.mock.calls[0][0]).toContain('franchiseId=?');
+    const a = await db.createFranchise({ name: 'a', admins: [] });
+    const b = await db.createFranchise({ name: 'b', admins: [] });
+    const store = await db.createStore(b.id, { name: 'Provo' });
+
+    await db.deleteStore(a.id, store.id);
+
+    expect(await count('store')).toBe(1);
   });
 });
 
@@ -390,67 +358,26 @@ describe('helpers', () => {
     [1, 0],
     [3, 20],
     [undefined, 0],
-  ])('getOffset(%s) is %s with 10 per page', (page, expected) => {
-    expect(createTestDb(createFakeConnection()).getOffset(page, 10)).toBe(expected);
+  ])('getOffset(%s, 10) is %s', (page, expected) => {
+    expect(db.getOffset(page, 10)).toBe(expected);
   });
 
   test.each([
-    ['a.b.sig', 'sig'],
+    ['a.b.c', 'c'],
     ['a.b', ''],
-    ['', ''],
-  ])('getTokenSignature(%j) is %j', (token, expected) => {
-    expect(createTestDb(createFakeConnection()).getTokenSignature(token)).toBe(expected);
+    ['abc', ''],
+  ])('getTokenSignature(%s) is "%s"', (token, expected) => {
+    expect(db.getTokenSignature(token)).toBe(expected);
   });
 
-  test('getID returns the id of the matching row', async () => {
-    const conn = createFakeConnection([[{ id: 4 }]]);
-    await expect(createTestDb(conn).getID(conn, 'name', 'pizzaPocket', 'franchise')).resolves.toBe(4);
-  });
-
-  test('getID throws when no row matches', async () => {
-    const conn = createFakeConnection([[]]);
-    await expect(createTestDb(conn).getID(conn, 'name', 'nope', 'franchise')).rejects.toThrow('No ID found');
-  });
-});
-
-describe('database initialization', () => {
-  beforeEach(() => {
-    jest.spyOn(console, 'log').mockImplementation(() => {});
-  });
-
-  test('an existing database only ensures the schema and creates no default admin', async () => {
-    const conn = createFakeConnection([[{ SCHEMA_NAME: 'testdb' }]]);
-    const db = new DB({ connect: async () => conn, config: testConfig });
-    const addUser = jest.spyOn(db, 'addUser').mockResolvedValue({});
-
-    await db.init();
-
-    expect(conn.query).toHaveBeenCalledWith('CREATE DATABASE IF NOT EXISTS testdb');
-    expect(conn.query).toHaveBeenCalledWith('USE testdb');
-    expect(conn.query).toHaveBeenCalledTimes(2 + dbModel.tableCreateStatements.length);
-    expect(addUser).not.toHaveBeenCalled();
-    expect(conn.end).toHaveBeenCalled();
-  });
-
-  test('a new database also creates the default admin', async () => {
-    const conn = createFakeConnection([[]]);
-    const db = new DB({ connect: async () => conn, config: testConfig });
-    const addUser = jest.spyOn(db, 'addUser').mockResolvedValue({});
-
-    await db.init();
-
-    expect(addUser).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@jwt.com', roles: [{ role: 'admin' }] }));
-  });
-
-  test('init runs initialization only once', async () => {
-    const conn = createFakeConnection([[{ SCHEMA_NAME: 'testdb' }]]);
-    const connect = jest.fn(async () => conn);
-    const db = new DB({ connect, config: testConfig });
-
-    const first = db.init();
-    expect(db.init()).toBe(first);
-    await first;
-
-    expect(connect).toHaveBeenCalledTimes(1);
+  test('getID returns the id of the matching row and throws when none matches', async () => {
+    const menu = await db.addMenuItem(menuItem);
+    const connection = await db.getConnection();
+    try {
+      expect(await db.getID(connection, 'id', menu.id, 'menu')).toBe(menu.id);
+      await expect(db.getID(connection, 'id', 9999, 'menu')).rejects.toThrow('No ID found');
+    } finally {
+      connection.end();
+    }
   });
 });

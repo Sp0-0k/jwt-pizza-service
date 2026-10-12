@@ -1,172 +1,275 @@
-const { createFranchiseRouter } = require('../src/routes/franchiseRouter.js');
-const { createFakeDb } = require('./helpers/fakeDb.js');
-const { createReq, createRes } = require('./helpers/fakeHttp.js');
-const { makeDiner, makeAdmin, makeFranchisee } = require('./helpers/fixtures.js');
+const request = require('supertest');
+const { createHarness } = require('./helpers/harness.js');
 
-function setup(dbImpls = {}) {
-  const db = createFakeDb(dbImpls);
-  const auth = { authenticateToken: (req, res, next) => next() };
-  const { handlers } = createFranchiseRouter({ db, auth });
-  return { db, handlers };
+const h = createHarness();
+beforeAll(h.start);
+beforeEach(h.reset);
+
+const count = async (table) => (await h.query(`SELECT COUNT(*) AS n FROM ${table}`))[0].n;
+
+async function world() {
+  const admin = await h.createAdmin();
+  const { franchisee, franchise } = await h.createFranchisee(admin, 'pizzaPocket');
+  return { admin, franchisee, franchise };
 }
 
-// Franchise 3 is administered by user 20.
-const franchise = { id: 3, name: 'pizzaPocket', admins: [{ id: 20, name: 'f', email: 'f@test.com' }], stores: [] };
-const owner = makeFranchisee(20, 3);
-const otherFranchisee = makeFranchisee(21, 4);
+const addStore = (headers, franchiseId, name = 'SLC') => request(h.app).post(`/api/franchise/${franchiseId}/store`).set(headers).send({ name });
 
-describe('getFranchises', () => {
-  test('passes the caller and paging/filter params to the DB and returns franchises with more', async () => {
-    const user = makeDiner(2);
-    const { db, handlers } = setup({ getFranchises: async () => [[franchise], true] });
-    const res = createRes();
+describe('GET /api/franchise', () => {
+  test('is public and shows stores without admins or revenue', async () => {
+    const { admin, franchise } = await world();
+    const store = (await addStore(admin.headers, franchise.id)).body;
 
-    await handlers.getFranchises(createReq({ user, query: { page: '1', limit: '5', name: 'pizza*' } }), res);
+    const res = await request(h.app).get('/api/franchise');
 
-    expect(db.getFranchises).toHaveBeenCalledWith(user, '1', '5', 'pizza*');
-    expect(res.json).toHaveBeenCalledWith({ franchises: [franchise], more: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ franchises: [{ id: franchise.id, name: 'pizzaPocket', stores: [{ id: store.id, name: 'SLC' }] }], more: false });
   });
 
-  test('returns an empty page', async () => {
-    const { handlers } = setup({ getFranchises: async () => [[], false] });
-    const res = createRes();
-    await handlers.getFranchises(createReq({ query: {} }), res);
-    expect(res.json).toHaveBeenCalledWith({ franchises: [], more: false });
+  test('shows an admin the franchise admins and store revenue', async () => {
+    const { admin, franchisee, franchise } = await world();
+    const store = (await addStore(admin.headers, franchise.id)).body;
+    const diner = await h.register();
+    const menu = await h.db.addMenuItem({ title: 'Veggie', description: 'd', image: 'p.png', price: 0.05 });
+    await h.db.addDinerOrder(diner.user, { franchiseId: franchise.id, storeId: store.id, items: [{ menuId: menu.id, description: 'Veggie', price: 0.05 }] });
+
+    const res = await request(h.app).get('/api/franchise').set(admin.headers);
+
+    const listed = res.body.franchises[0];
+    expect(listed.admins).toEqual([{ id: franchisee.user.id, name: 'Franchisee', email: franchisee.email }]);
+    expect(listed.stores).toHaveLength(1);
+    expect(listed.stores[0]).toMatchObject({ id: store.id, name: 'SLC' });
+    expect(listed.stores[0].totalRevenue).toBeCloseTo(0.05);
+  });
+
+  test('pages through franchises and reports whether more remain', async () => {
+    const admin = await h.createAdmin();
+    for (const name of ['f1', 'f2', 'f3']) {
+      await h.createFranchise(admin, name);
+    }
+
+    const first = await request(h.app).get('/api/franchise?page=0&limit=2');
+    const second = await request(h.app).get('/api/franchise?page=1&limit=2');
+
+    expect(first.body.franchises).toHaveLength(2);
+    expect(first.body.more).toBe(true);
+    expect(second.body.franchises).toHaveLength(1);
+    expect(second.body.more).toBe(false);
+  });
+
+  test('filters by name with * as a wildcard and treats SQL metacharacters literally', async () => {
+    const admin = await h.createAdmin();
+    await h.createFranchise(admin, 'pizzaPocket');
+    await h.createFranchise(admin, 'burgerBarn');
+
+    const filtered = await request(h.app).get('/api/franchise?name=pizza*');
+    const injected = await request(h.app).get(`/api/franchise?name=${encodeURIComponent("' OR '1'='1")}`);
+
+    expect(filtered.body.franchises.map((f) => f.name)).toEqual(['pizzaPocket']);
+    expect(injected.status).toBe(200);
+    expect(injected.body.franchises).toEqual([]);
+  });
+
+  test.each([['limit=abc'], ['page=-1'], ['limit=0']])('rejects invalid paging (%s) with 400', async (qs) => {
+    const res = await request(h.app).get(`/api/franchise?${qs}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ message: 'invalid paging parameters' });
   });
 });
 
-describe('getUserFranchises', () => {
+describe('GET /api/franchise/:userId', () => {
   test('lets a user list their own franchises', async () => {
-    const { db, handlers } = setup({ getUserFranchises: async () => [franchise] });
-    const res = createRes();
-    await handlers.getUserFranchises(createReq({ user: owner, params: { userId: '20' } }), res);
-    expect(db.getUserFranchises).toHaveBeenCalledWith(20);
-    expect(res.json).toHaveBeenCalledWith([franchise]);
+    const { franchisee, franchise } = await world();
+
+    const res = await request(h.app).get(`/api/franchise/${franchisee.user.id}`).set(franchisee.headers);
+
+    expect(res.status).toBe(200);
+    expect(res.body.map((f) => f.id)).toEqual([franchise.id]);
   });
 
-  test('lets an admin list another user\'s franchises', async () => {
-    const { db, handlers } = setup({ getUserFranchises: async () => [franchise] });
-    const res = createRes();
-    await handlers.getUserFranchises(createReq({ user: makeAdmin(1), params: { userId: '20' } }), res);
-    expect(db.getUserFranchises).toHaveBeenCalledWith(20);
-    expect(res.json).toHaveBeenCalledWith([franchise]);
+  test("lets an admin list another user's franchises", async () => {
+    const { admin, franchisee, franchise } = await world();
+
+    const res = await request(h.app).get(`/api/franchise/${franchisee.user.id}`).set(admin.headers);
+
+    expect(res.body.map((f) => f.id)).toEqual([franchise.id]);
   });
 
-  test('returns an empty list without a lookup for another ordinary user', async () => {
-    const { db, handlers } = setup();
-    const res = createRes();
-    await handlers.getUserFranchises(createReq({ user: makeDiner(2), params: { userId: '20' } }), res);
-    expect(db.getUserFranchises).not.toHaveBeenCalled();
-    expect(res.json).toHaveBeenCalledWith([]);
-  });
-});
+  test('returns an empty list for another ordinary user', async () => {
+    const { franchisee } = await world();
+    const stranger = await h.register();
 
-describe('createFranchise', () => {
-  const body = { name: 'pizzaPocket', admins: [{ email: 'f@test.com' }] };
+    const res = await request(h.app).get(`/api/franchise/${franchisee.user.id}`).set(stranger.headers);
 
-  test.each([
-    ['diner', makeDiner(2)],
-    ['franchisee', owner],
-  ])('forbids a %s and creates nothing', async (name, user) => {
-    const { db, handlers } = setup();
-    await expect(handlers.createFranchise(createReq({ user, body }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.createFranchise).not.toHaveBeenCalled();
-  });
-
-  test('lets an admin create a franchise and returns it', async () => {
-    const created = { ...body, id: 9 };
-    const { db, handlers } = setup({ createFranchise: async () => created });
-    const res = createRes();
-    await handlers.createFranchise(createReq({ user: makeAdmin(1), body }), res);
-    expect(db.createFranchise).toHaveBeenCalledWith(body);
-    expect(res.send).toHaveBeenCalledWith(created);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
   });
 });
 
-describe('deleteFranchise', () => {
-  // BUG (unauthenticated franchise delete): the handler and route have no role check.
-  test.each([
-    ['diner', makeDiner(2)],
-    ['franchisee', owner],
-    ['anonymous caller', undefined],
-  ])('forbids a %s and deletes nothing', async (name, user) => {
-    const { db, handlers } = setup();
-    await expect(handlers.deleteFranchise(createReq({ user, params: { franchiseId: '3' } }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.deleteFranchise).not.toHaveBeenCalled();
+describe('POST /api/franchise', () => {
+  test('lets an admin create a franchise, granting the admins the franchisee role', async () => {
+    const admin = await h.createAdmin();
+    const diner = await h.register({ name: 'Future Owner' });
+
+    const res = await request(h.app)
+      .post('/api/franchise')
+      .set(admin.headers)
+      .send({ name: 'pizzaPocket', admins: [{ email: diner.email }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: expect.any(Number), name: 'pizzaPocket', admins: [{ email: diner.email, id: diner.user.id, name: 'Future Owner' }] });
+    const relogin = await h.sessionFor(diner.email);
+    expect(relogin.user.roles).toContainEqual({ objectId: res.body.id, role: 'franchisee' });
   });
 
-  test('lets an admin delete a franchise', async () => {
-    const { db, handlers } = setup({ deleteFranchise: async () => {} });
-    const res = createRes();
-    await handlers.deleteFranchise(createReq({ user: makeAdmin(1), params: { franchiseId: '3' } }), res);
-    expect(db.deleteFranchise).toHaveBeenCalledWith(3);
-    expect(res.json).toHaveBeenCalledWith({ message: 'franchise deleted' });
+  test.each([
+    ['a diner', async () => (await h.register()).headers],
+    ['a franchisee', async () => (await world()).franchisee.headers],
+  ])('forbids %s and creates nothing', async (name, headersFor) => {
+    const headers = await headersFor();
+
+    const res = await request(h.app).post('/api/franchise').set(headers).send({ name: 'hijack', admins: [] });
+
+    expect(res.status).toBe(403);
+    expect(await h.query("SELECT id FROM franchise WHERE name='hijack'")).toEqual([]);
+  });
+
+  test('an unknown admin email responds 404 and creates nothing', async () => {
+    const admin = await h.createAdmin();
+
+    const res = await request(h.app)
+      .post('/api/franchise')
+      .set(admin.headers)
+      .send({ name: 'pizzaPocket', admins: [{ email: 'ghost@test.com' }] });
+
+    expect(res.status).toBe(404);
+    expect(res.body.message).toBe('unknown user for franchise admin ghost@test.com provided');
+    expect(await count('franchise')).toBe(0);
   });
 });
 
-describe('createStore', () => {
-  const body = { name: 'SLC' };
-  const store = { id: 8, franchiseId: 3, name: 'SLC' };
+describe('DELETE /api/franchise/:franchiseId', () => {
+  test('anonymous callers get 401 and nothing is deleted', async () => {
+    const { franchise } = await world();
 
-  test.each([
-    ['an admin', makeAdmin(1)],
-    ['the franchise\'s franchisee', owner],
-  ])('lets %s create a store', async (name, user) => {
-    const { db, handlers } = setup({ getFranchise: async () => franchise, createStore: async () => store });
-    const res = createRes();
-    await handlers.createStore(createReq({ user, params: { franchiseId: '3' }, body }), res);
-    expect(db.createStore).toHaveBeenCalledWith(3, body);
-    expect(res.send).toHaveBeenCalledWith(store);
+    const res = await request(h.app).delete(`/api/franchise/${franchise.id}`);
+
+    expect(res.status).toBe(401);
+    expect(await count('franchise')).toBe(1);
   });
 
   test.each([
-    ['a diner', makeDiner(2)],
-    ['another franchise\'s franchisee', otherFranchisee],
-  ])('forbids %s and creates nothing', async (name, user) => {
-    const { db, handlers } = setup({ getFranchise: async () => franchise });
-    await expect(handlers.createStore(createReq({ user, params: { franchiseId: '3' }, body }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.createStore).not.toHaveBeenCalled();
+    ['a diner', async () => (await h.register()).headers],
+    ['a franchisee', async (w) => w.franchisee.headers],
+  ])('forbids %s and deletes nothing', async (name, headersFor) => {
+    const w = await world();
+    const headers = await headersFor(w);
+
+    const res = await request(h.app).delete(`/api/franchise/${w.franchise.id}`).set(headers);
+
+    expect(res.status).toBe(403);
+    expect(await count('franchise')).toBe(1);
   });
 
-  test('forbids creation for an unknown franchise', async () => {
-    const { db, handlers } = setup({ getFranchise: async () => null });
-    await expect(handlers.createStore(createReq({ user: makeAdmin(1), params: { franchiseId: '99' }, body }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.createStore).not.toHaveBeenCalled();
+  test('lets an admin delete a franchise with its stores and franchisee roles', async () => {
+    const { admin, franchisee, franchise } = await world();
+    await addStore(admin.headers, franchise.id);
+
+    const res = await request(h.app).delete(`/api/franchise/${franchise.id}`).set(admin.headers);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ message: 'franchise deleted' });
+    expect(await count('franchise')).toBe(0);
+    expect(await count('store')).toBe(0);
+    const relogin = await h.sessionFor(franchisee.email);
+    expect(relogin.user.roles.map((r) => r.role)).not.toContain('franchisee');
+  });
+});
+
+describe('POST /api/franchise/:franchiseId/store', () => {
+  test.each([
+    ['an admin', (w) => w.admin.headers],
+    ["the franchise's franchisee", (w) => w.franchisee.headers],
+  ])('lets %s create a store', async (name, headersFor) => {
+    const w = await world();
+
+    const res = await addStore(headersFor(w), w.franchise.id);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: expect.any(Number), franchiseId: w.franchise.id, name: 'SLC' });
+    expect(await h.query('SELECT name FROM store WHERE id=?', [res.body.id])).toEqual([{ name: 'SLC' }]);
+  });
+
+  test.each([
+    ['a diner', async () => (await h.register()).headers],
+    ["another franchise's franchisee", async (w) => (await h.createFranchisee(w.admin, 'otherFranchise')).franchisee.headers],
+  ])('forbids %s and creates nothing', async (name, headersFor) => {
+    const w = await world();
+    const headers = await headersFor(w);
+
+    const res = await addStore(headers, w.franchise.id);
+
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('unable to create a store');
+    expect(await count('store')).toBe(0);
+  });
+
+  test('fails for a franchise that does not exist and creates no store', async () => {
+    const admin = await h.createAdmin();
+
+    const res = await addStore(admin.headers, 9999);
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(await count('store')).toBe(0);
   });
 
   test('uses the franchise id from the path, not one in the body', async () => {
-    const { db, handlers } = setup({ getFranchise: async () => franchise, createStore: async () => store });
-    await handlers.createStore(createReq({ user: makeAdmin(1), params: { franchiseId: '3' }, body: { name: 'SLC', franchiseId: 4 } }), createRes());
-    expect(db.createStore).toHaveBeenCalledWith(3, { name: 'SLC', franchiseId: 4 });
+    const w = await world();
+    const other = await h.createFranchise(w.admin, 'otherFranchise');
+
+    const res = await request(h.app).post(`/api/franchise/${w.franchise.id}/store`).set(w.admin.headers).send({ name: 'SLC', franchiseId: other.id });
+
+    expect((await h.query('SELECT franchiseId FROM store WHERE id=?', [res.body.id]))[0].franchiseId).toBe(w.franchise.id);
   });
 });
 
-describe('deleteStore', () => {
-  const params = { franchiseId: '3', storeId: '8' };
-
+describe('DELETE /api/franchise/:franchiseId/store/:storeId', () => {
   test.each([
-    ['an admin', makeAdmin(1)],
-    ['the franchise\'s franchisee', owner],
-  ])('lets %s delete a store', async (name, user) => {
-    const { db, handlers } = setup({ getFranchise: async () => franchise, deleteStore: async () => {} });
-    const res = createRes();
-    await handlers.deleteStore(createReq({ user, params }), res);
-    expect(db.deleteStore).toHaveBeenCalledWith(3, 8);
-    expect(res.json).toHaveBeenCalledWith({ message: 'store deleted' });
+    ['an admin', (w) => w.admin.headers],
+    ["the franchise's franchisee", (w) => w.franchisee.headers],
+  ])('lets %s delete a store', async (name, headersFor) => {
+    const w = await world();
+    const store = (await addStore(w.admin.headers, w.franchise.id)).body;
+
+    const res = await request(h.app).delete(`/api/franchise/${w.franchise.id}/store/${store.id}`).set(headersFor(w));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ message: 'store deleted' });
+    expect(await count('store')).toBe(0);
   });
 
   test.each([
-    ['a diner', makeDiner(2)],
-    ['another franchise\'s franchisee', otherFranchisee],
-  ])('forbids %s and deletes nothing', async (name, user) => {
-    const { db, handlers } = setup({ getFranchise: async () => franchise });
-    await expect(handlers.deleteStore(createReq({ user, params }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.deleteStore).not.toHaveBeenCalled();
+    ['a diner', async () => (await h.register()).headers],
+    ["another franchise's franchisee", async (w) => (await h.createFranchisee(w.admin, 'otherFranchise')).franchisee.headers],
+  ])('forbids %s and deletes nothing', async (name, headersFor) => {
+    const w = await world();
+    const store = (await addStore(w.admin.headers, w.franchise.id)).body;
+    const headers = await headersFor(w);
+
+    const res = await request(h.app).delete(`/api/franchise/${w.franchise.id}/store/${store.id}`).set(headers);
+
+    expect(res.status).toBe(403);
+    expect(await count('store')).toBe(1);
   });
 
-  test('forbids deletion for an unknown franchise', async () => {
-    const { db, handlers } = setup({ getFranchise: async () => null });
-    await expect(handlers.deleteStore(createReq({ user: makeAdmin(1), params }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.deleteStore).not.toHaveBeenCalled();
+  test('only deletes a store that belongs to the franchise in the path', async () => {
+    const w = await world();
+    const other = await h.createFranchise(w.admin, 'otherFranchise');
+    const otherStore = (await addStore(w.admin.headers, other.id, 'Provo')).body;
+
+    await request(h.app).delete(`/api/franchise/${w.franchise.id}/store/${otherStore.id}`).set(w.admin.headers);
+
+    expect(await h.query('SELECT id FROM store WHERE id=?', [otherStore.id])).toHaveLength(1);
   });
 });

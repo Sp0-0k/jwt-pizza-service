@@ -1,267 +1,167 @@
 const jwt = require('jsonwebtoken');
+const request = require('supertest');
 const config = require('../src/config.js');
-const { createAuth, createAuthRouter } = require('../src/routes/authRouter.js');
-const { StatusCodeError } = require('../src/endpointHelper.js');
-const { Role } = require('../src/model/model.js');
-const { createFakeDb } = require('./helpers/fakeDb.js');
-const { createReq, createRes } = require('./helpers/fakeHttp.js');
-const { makeDiner } = require('./helpers/fixtures.js');
-const { signToken } = require('./helpers/tokens.js');
+const { createHarness } = require('./helpers/harness.js');
 
-const bearer = (token) => ({ authorization: `Bearer ${token}` });
+const h = createHarness();
+beforeAll(h.start);
+beforeEach(h.reset);
 
-afterEach(() => {
-  jest.restoreAllMocks();
-});
+const count = async (table) => (await h.query(`SELECT COUNT(*) AS n FROM ${table}`))[0].n;
 
-describe('auth.setAuthUser', () => {
-  async function run(db, headers) {
-    const req = createReq({ headers });
-    const next = jest.fn();
-    await createAuth({ db }).setAuthUser(req, createRes(), next);
-    return { req, next };
-  }
+describe('POST /api/auth (register)', () => {
+  test('creates a diner and returns the user and a verifiable token without a password', async () => {
+    const res = await request(h.app).post('/api/auth').send({ name: 'New Diner', email: 'new@test.com', password: 'pw' });
 
-  test('leaves req.user unset without an Authorization header', async () => {
-    const db = createFakeDb();
-    const { req, next } = await run(db, {});
-    expect(req.user).toBeUndefined();
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(db.isLoggedIn).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(res.body.user).toMatchObject({ name: 'New Diner', email: 'new@test.com', roles: [{ role: 'diner' }] });
+    expect(res.body.user).not.toHaveProperty('password');
+    expect(jwt.verify(res.body.token, config.jwtSecret)).toMatchObject({ id: res.body.user.id, email: 'new@test.com' });
   });
 
-  test('leaves req.user unset when the header has no token', async () => {
-    const db = createFakeDb();
-    const { req } = await run(db, { authorization: 'Bearer' });
-    expect(req.user).toBeUndefined();
-    expect(db.isLoggedIn).not.toHaveBeenCalled();
+  test('persists the user so they can log in', async () => {
+    const diner = await h.register({ email: 'persist@test.com' });
+
+    const session = await h.login('persist@test.com', diner.password);
+
+    expect(session.user.id).toBe(diner.user.id);
   });
 
-  test('sets req.user with working role checks for a valid, active token', async () => {
-    const diner = makeDiner(5);
-    const token = signToken(diner);
-    const db = createFakeDb({ isLoggedIn: async () => true });
+  test.each(['name', 'email', 'password'])('responds 400 and creates no user when %s is missing', async (field) => {
+    const body = { name: 'N', email: 'n@test.com', password: 'pw', [field]: undefined };
 
-    const { req, next } = await run(db, bearer(token));
+    const res = await request(h.app).post('/api/auth').send(body);
 
-    expect(db.isLoggedIn).toHaveBeenCalledWith(token);
-    expect(req.user).toMatchObject({ id: 5, name: diner.name, email: diner.email });
-    expect(req.user.isRole(Role.Diner)).toBe(true);
-    expect(req.user.isRole(Role.Admin)).toBe(false);
-    expect(next).toHaveBeenCalledTimes(1);
-  });
-
-  test('does not authenticate a token the database says is revoked', async () => {
-    const db = createFakeDb({ isLoggedIn: async () => false });
-    const { req, next } = await run(db, bearer(signToken(makeDiner(5))));
-    expect(req.user).toBeUndefined();
-    expect(next).toHaveBeenCalledTimes(1);
-  });
-
-  test('rejects a token whose payload was tampered with to grant admin', async () => {
-    const [header, , signature] = signToken(makeDiner(5)).split('.');
-    const adminPayload = Buffer.from(JSON.stringify({ id: 5, name: 'x', email: 'x@test.com', roles: [{ role: Role.Admin }] })).toString('base64url');
-    const db = createFakeDb({ isLoggedIn: async () => true });
-
-    const { req } = await run(db, bearer(`${header}.${adminPayload}.${signature}`));
-
-    expect(req.user).toBeFalsy();
-  });
-
-  test('rejects a token signed with a different secret', async () => {
-    const forged = jwt.sign({ id: 5, roles: [{ role: Role.Admin }] }, 'some-other-secret');
-    const db = createFakeDb({ isLoggedIn: async () => true });
-    const { req } = await run(db, bearer(forged));
-    expect(req.user).toBeFalsy();
-  });
-
-  test('rejects an expired token', async () => {
-    const db = createFakeDb({ isLoggedIn: async () => true });
-    const { req } = await run(db, bearer(signToken(makeDiner(5), { expiresIn: -10 })));
-    expect(req.user).toBeFalsy();
-  });
-});
-
-describe('auth.authenticateToken', () => {
-  test('responds 401 when there is no user', () => {
-    const res = createRes();
-    const next = jest.fn();
-    createAuth({ db: createFakeDb() }).authenticateToken(createReq(), res, next);
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.send).toHaveBeenCalledWith({ message: 'unauthorized' });
-    expect(next).not.toHaveBeenCalled();
-  });
-
-  test('calls next when there is a user', () => {
-    const res = createRes();
-    const next = jest.fn();
-    createAuth({ db: createFakeDb() }).authenticateToken(createReq({ user: makeDiner() }), res, next);
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(res.status).not.toHaveBeenCalled();
-  });
-});
-
-describe('auth.setAuth and auth.clearAuth', () => {
-  test('setAuth signs a verifiable token and records the login', async () => {
-    const diner = makeDiner(8);
-    const db = createFakeDb({ loginUser: async () => {} });
-
-    const token = await createAuth({ db }).setAuth(diner);
-
-    expect(jwt.verify(token, config.jwtSecret)).toMatchObject({ id: 8, email: diner.email });
-    expect(db.loginUser).toHaveBeenCalledWith(8, token);
-  });
-
-  test('clearAuth logs out the token from the Authorization header', async () => {
-    const db = createFakeDb({ logoutUser: async () => {} });
-    await createAuth({ db }).clearAuth(createReq({ headers: bearer('a.b.c') }));
-    expect(db.logoutUser).toHaveBeenCalledWith('a.b.c');
-  });
-
-  test('clearAuth does nothing without a token', async () => {
-    const db = createFakeDb();
-    await createAuth({ db }).clearAuth(createReq());
-    expect(db.logoutUser).not.toHaveBeenCalled();
-  });
-});
-
-function setup(dbImpls = {}) {
-  const db = createFakeDb(dbImpls);
-  const auth = {
-    setAuth: jest.fn(async () => 'token-123'),
-    clearAuth: jest.fn(async () => {}),
-    authenticateToken: (req, res, next) => next(),
-  };
-  const { handlers } = createAuthRouter({ db, auth });
-  return { db, auth, handlers };
-}
-
-describe('register handler', () => {
-  const body = { name: 'New Diner', email: 'new@test.com', password: 'pw' };
-
-  test('creates a diner and returns the user and a token without a password', async () => {
-    const created = { id: 9, name: body.name, email: body.email, roles: [{ role: Role.Diner }], password: undefined };
-    const { db, auth, handlers } = setup({ addUser: async () => created });
-    const res = createRes();
-
-    await handlers.register(createReq({ body }), res);
-
-    expect(db.addUser).toHaveBeenCalledWith({ ...body, roles: [{ role: Role.Diner }] });
-    expect(auth.setAuth).toHaveBeenCalledWith(created);
-    expect(res.json).toHaveBeenCalledWith({ user: created, token: 'token-123' });
-    expect(JSON.stringify(res.json.mock.calls[0][0])).not.toContain('password');
-  });
-
-  test.each(['name', 'email', 'password'])('responds 400 and writes nothing when %s is missing', async (field) => {
-    const { db, auth, handlers } = setup();
-    const res = createRes();
-
-    await handlers.register(createReq({ body: { ...body, [field]: undefined } }), res);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(db.addUser).not.toHaveBeenCalled();
-    expect(auth.setAuth).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(await count('user')).toBe(0);
   });
 
   test('ignores roles supplied by the caller and always registers a diner', async () => {
-    const { db, handlers } = setup({ addUser: async (user) => ({ ...user, id: 9 }) });
+    const res = await request(h.app)
+      .post('/api/auth')
+      .send({ name: 'Sneaky', email: 's@test.com', password: 'pw', roles: [{ role: 'admin' }] });
 
-    await handlers.register(createReq({ body: { ...body, roles: [{ role: Role.Admin }] } }), createRes());
+    expect(res.body.user.roles).toEqual([{ role: 'diner' }]);
+    const adminOnly = await request(h.app).put('/api/order/menu').set({ Authorization: `Bearer ${res.body.token}` }).send({});
+    expect(adminOnly.status).toBe(403);
+  });
 
-    expect(db.addUser).toHaveBeenCalledWith(expect.objectContaining({ roles: [{ role: Role.Diner }] }));
+  test('stores names with SQL metacharacters literally', async () => {
+    const name = "Robert'); DROP TABLE user;--";
+
+    const diner = await h.register({ name });
+
+    const rows = await h.query('SELECT name FROM user WHERE id=?', [diner.user.id]);
+    expect(rows).toEqual([{ name }]);
   });
 });
 
-describe('login handler', () => {
-  test('returns the user and a token for valid credentials', async () => {
-    const user = makeDiner(3);
-    const { db, auth, handlers } = setup({ getUser: async () => user });
-    const res = createRes();
+describe('PUT /api/auth (login)', () => {
+  test('returns the user and a token that authenticates', async () => {
+    const diner = await h.register({ email: 'a@test.com' });
 
-    await handlers.login(createReq({ body: { email: 'a@test.com', password: 'pw' } }), res);
+    const res = await request(h.app).put('/api/auth').send({ email: 'a@test.com', password: diner.password });
 
-    expect(db.getUser).toHaveBeenCalledWith('a@test.com', 'pw');
-    expect(auth.setAuth).toHaveBeenCalledWith(user);
-    expect(res.json).toHaveBeenCalledWith({ user, token: 'token-123' });
+    expect(res.status).toBe(200);
+    expect(res.body.user).toMatchObject({ id: diner.user.id, email: 'a@test.com', roles: [{ role: 'diner' }] });
+    const me = await request(h.app).get('/api/user/me').set({ Authorization: `Bearer ${res.body.token}` });
+    expect(me.status).toBe(200);
   });
 
-  test('does not issue a token for unknown credentials', async () => {
-    const { auth, handlers } = setup({
-      getUser: async () => {
-        throw new StatusCodeError('unknown user', 404);
-      },
-    });
+  test('a wrong password responds 404 and issues no token', async () => {
+    const diner = await h.register();
+    const before = await count('auth');
 
-    await expect(handlers.login(createReq({ body: { email: 'a@test.com', password: 'bad' } }), createRes())).rejects.toMatchObject({ statusCode: 404 });
-    expect(auth.setAuth).not.toHaveBeenCalled();
+    const res = await request(h.app).put('/api/auth').send({ email: diner.email, password: 'wrong' });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ message: 'unknown user' });
+    expect(await count('auth')).toBe(before);
   });
 
-  // BUG (empty-password bypass): a missing password reaches the DB, which skips the password check.
-  test.each(['email', 'password'])('responds 400 without a lookup or token when %s is missing', async (field) => {
-    const { db, auth, handlers } = setup({ getUser: async () => makeDiner(3) });
-    const res = createRes();
+  test('an unknown email responds 404 and issues no token', async () => {
+    const res = await request(h.app).put('/api/auth').send({ email: 'ghost@test.com', password: 'pw' });
 
-    await handlers.login(createReq({ body: { email: 'a@test.com', password: 'pw', [field]: undefined } }), res);
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty('token');
+  });
 
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(db.getUser).not.toHaveBeenCalled();
-    expect(auth.setAuth).not.toHaveBeenCalled();
+  test.each(['email', 'password'])('responds 400 without issuing a token when %s is missing', async (field) => {
+    const diner = await h.register();
+    const before = await count('auth');
+
+    const res = await request(h.app).put('/api/auth').send({ email: diner.email, password: diner.password, [field]: undefined });
+
+    expect(res.status).toBe(400);
+    expect(await count('auth')).toBe(before);
+  });
+
+  test('an empty password is rejected rather than skipping the password check', async () => {
+    const diner = await h.register();
+
+    const res = await request(h.app).put('/api/auth').send({ email: diner.email, password: '' });
+
+    expect(res.status).toBe(400);
   });
 });
 
-describe('logout handler', () => {
-  test('clears the auth for the request and confirms', async () => {
-    const { auth, handlers } = setup();
-    const req = createReq({ headers: bearer('a.b.c') });
-    const res = createRes();
+describe('DELETE /api/auth (logout)', () => {
+  test('revokes the token so it can no longer be used', async () => {
+    const diner = await h.register();
 
-    await handlers.logout(req, res);
+    const res = await request(h.app).delete('/api/auth').set(diner.headers);
 
-    expect(auth.clearAuth).toHaveBeenCalledWith(req);
-    expect(res.json).toHaveBeenCalledWith({ message: 'logout successful' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ message: 'logout successful' });
+    expect((await request(h.app).get('/api/user/me').set(diner.headers)).status).toBe(401);
+  });
+
+  test("leaves another user's session valid", async () => {
+    const first = await h.register();
+    const second = await h.register();
+
+    await request(h.app).delete('/api/auth').set(first.headers);
+
+    expect((await request(h.app).get('/api/user/me').set(second.headers)).status).toBe(200);
   });
 });
 
-describe('logout with real auth and a stateful token store', () => {
-  function statefulSetup() {
-    const active = new Set();
-    const db = createFakeDb({
-      loginUser: async (id, token) => {
-        active.add(token);
-      },
-      isLoggedIn: async (token) => active.has(token),
-      logoutUser: async (token) => {
-        active.delete(token);
-      },
-    });
-    const auth = createAuth({ db });
-    const { handlers } = createAuthRouter({ db, auth });
-    return { auth, handlers };
-  }
+describe('token validation', () => {
+  const adminOnly = (headers) => request(h.app).get('/api/user').set(headers);
 
-  async function authenticate(auth, token) {
-    const req = createReq({ headers: bearer(token) });
-    await auth.setAuthUser(req, createRes(), jest.fn());
-    return req.user;
-  }
+  test('a payload tampered with to grant admin is rejected', async () => {
+    const diner = await h.register();
+    const [header, , signature] = diner.token.split('.');
+    const payload = Buffer.from(JSON.stringify({ id: diner.user.id, name: 'x', email: diner.email, roles: [{ role: 'admin' }] })).toString('base64url');
 
-  test('revokes the same token so it cannot be reused', async () => {
-    const { auth, handlers } = statefulSetup();
-    const token = await auth.setAuth(makeDiner(4));
-    expect(await authenticate(auth, token)).toBeTruthy();
+    const res = await adminOnly({ Authorization: `Bearer ${header}.${payload}.${signature}` });
 
-    await handlers.logout(createReq({ headers: bearer(token) }), createRes());
-
-    expect(await authenticate(auth, token)).toBeFalsy();
+    expect(res.status).toBe(401);
   });
 
-  test('leaves a different session valid', async () => {
-    const { auth, handlers } = statefulSetup();
-    const first = await auth.setAuth(makeDiner(4));
-    const second = await auth.setAuth(makeDiner(5));
+  test('a token signed with a different secret is rejected', async () => {
+    const forged = jwt.sign({ id: 1, roles: [{ role: 'admin' }] }, 'some-other-secret');
 
-    await handlers.logout(createReq({ headers: bearer(first) }), createRes());
+    const res = await adminOnly({ Authorization: `Bearer ${forged}` });
 
-    expect(await authenticate(auth, second)).toBeTruthy();
+    expect(res.status).toBe(401);
+  });
+
+  test('an expired token is rejected even though it is on record', async () => {
+    const diner = await h.register();
+    const expired = jwt.sign({ id: diner.user.id, name: diner.user.name, email: diner.email, roles: diner.user.roles }, config.jwtSecret, { expiresIn: -10 });
+    await h.db.loginUser(diner.user.id, expired);
+
+    const res = await request(h.app).get('/api/user/me').set({ Authorization: `Bearer ${expired}` });
+
+    expect(res.status).toBe(401);
+  });
+
+  test.each(['Bearer', 'Bearer not-a-jwt', 'Bearer a.b.c', 'garbage'])('the Authorization value "%s" is treated as anonymous', async (value) => {
+    const protectedRes = await request(h.app).get('/api/user/me').set('Authorization', value);
+    const publicRes = await request(h.app).get('/api/order/menu').set('Authorization', value);
+
+    expect(protectedRes.status).toBe(401);
+    expect(publicRes.status).toBe(200);
   });
 });

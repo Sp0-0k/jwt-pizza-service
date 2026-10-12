@@ -1,116 +1,130 @@
-const { createOrderRouter } = require('../src/routes/orderRouter.js');
-const { createFakeDb } = require('./helpers/fakeDb.js');
-const { createReq, createRes } = require('./helpers/fakeHttp.js');
-const { makeDiner, makeAdmin, makeFranchisee } = require('./helpers/fixtures.js');
+const request = require('supertest');
+const { createHarness } = require('./helpers/harness.js');
 
-function setup(dbImpls = {}, createOrderImpl) {
-  const db = createFakeDb(dbImpls);
-  const auth = { authenticateToken: (req, res, next) => next() };
-  const factoryClient = { createOrder: jest.fn(createOrderImpl ?? (async () => ({ ok: true, body: {} }))) };
-  const { handlers } = createOrderRouter({ db, auth, factoryClient });
-  return { db, factoryClient, handlers };
-}
+const h = createHarness();
+beforeAll(h.start);
+beforeEach(h.reset);
 
-describe('getMenu', () => {
-  test('sends the menu', async () => {
-    const menu = [{ id: 1, title: 'Veggie' }];
-    const { handlers } = setup({ getMenu: async () => menu });
-    const res = createRes();
-    await handlers.getMenu(createReq(), res);
-    expect(res.send).toHaveBeenCalledWith(menu);
+const item = { title: 'Student', description: 'Just carbs', image: 'pizza9.png', price: 0.0001 };
+const orderFor = (menuId) => ({ franchiseId: 1, storeId: 2, items: [{ menuId, description: 'Veggie', price: 0.05 }] });
+const count = async (table) => (await h.query(`SELECT COUNT(*) AS n FROM ${table}`))[0].n;
+
+describe('GET /api/order/menu', () => {
+  test('is public and empty when there are no items', async () => {
+    const res = await request(h.app).get('/api/order/menu');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
   });
 
-  test('sends an empty menu', async () => {
-    const { handlers } = setup({ getMenu: async () => [] });
-    const res = createRes();
-    await handlers.getMenu(createReq(), res);
-    expect(res.send).toHaveBeenCalledWith([]);
+  test('returns the stored items', async () => {
+    const stored = await h.db.addMenuItem(item);
+
+    const res = await request(h.app).get('/api/order/menu');
+
+    expect(res.body).toEqual([{ id: stored.id, ...item }]);
   });
 });
 
-describe('addMenuItem', () => {
-  const item = { title: 'Student', description: 'Just carbs', image: 'pizza9.png', price: 0.0001 };
+describe('PUT /api/order/menu', () => {
+  test('lets an admin add an item and returns the updated menu', async () => {
+    const admin = await h.createAdmin();
+
+    const res = await request(h.app).put('/api/order/menu').set(admin.headers).send(item);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ id: expect.any(Number), ...item }]);
+    expect(await count('menu')).toBe(1);
+  });
 
   test.each([
-    ['diner', makeDiner(2)],
-    ['franchisee', makeFranchisee(2, 3)],
-  ])('forbids a %s and writes nothing', async (name, user) => {
-    const { db, handlers } = setup();
-    await expect(handlers.addMenuItem(createReq({ user, body: item }), createRes())).rejects.toMatchObject({ statusCode: 403 });
-    expect(db.addMenuItem).not.toHaveBeenCalled();
-  });
+    ['a diner', async () => (await h.register()).headers],
+    ['a franchisee', async () => (await h.createFranchisee(await h.createAdmin())).franchisee.headers],
+  ])('forbids %s and adds nothing', async (name, headersFor) => {
+    const headers = await headersFor();
 
-  test('lets an admin add an item and returns the updated menu', async () => {
-    const menu = [{ id: 1, ...item }];
-    const { db, handlers } = setup({ addMenuItem: async () => ({ id: 1, ...item }), getMenu: async () => menu });
-    const res = createRes();
+    const res = await request(h.app).put('/api/order/menu').set(headers).send(item);
 
-    await handlers.addMenuItem(createReq({ user: makeAdmin(1), body: item }), res);
-
-    expect(db.addMenuItem).toHaveBeenCalledWith(item);
-    expect(res.send).toHaveBeenCalledWith(menu);
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('unable to add menu item');
+    expect(await count('menu')).toBe(0);
   });
 });
 
-describe('getOrders', () => {
-  test('returns only the authenticated diner\'s orders for the requested page', async () => {
-    const diner = makeDiner(4);
-    const page = { dinerId: 4, orders: [], page: 2 };
-    const { db, handlers } = setup({ getOrders: async () => page });
-    const res = createRes();
-
-    await handlers.getOrders(createReq({ user: diner, query: { page: '2' } }), res);
-
-    expect(db.getOrders).toHaveBeenCalledWith(diner, '2');
-    expect(res.json).toHaveBeenCalledWith(page);
-  });
-});
-
-describe('createOrder', () => {
-  const orderReq = { franchiseId: 1, storeId: 2, items: [{ menuId: 1, description: 'Veggie', price: 0.05 }] };
-  const stored = { ...orderReq, id: 77 };
-  const diner = makeDiner(4);
-
+describe('POST /api/order', () => {
   test('persists the order, sends it to the factory and returns the factory jwt', async () => {
-    const { db, factoryClient, handlers } = setup(
-      { addDinerOrder: async () => stored },
-      async () => ({ ok: true, body: { reportUrl: 'https://report', jwt: 'factory.jwt' } })
-    );
-    const res = createRes();
+    const diner = await h.register({ name: 'Dee Diner' });
+    const menu = await h.db.addMenuItem(item);
+    const orderReq = orderFor(menu.id);
 
-    await handlers.createOrder(createReq({ user: diner, body: orderReq }), res);
+    const res = await request(h.app).post('/api/order').set(diner.headers).send(orderReq);
 
-    expect(db.addDinerOrder).toHaveBeenCalledWith(diner, orderReq);
-    expect(factoryClient.createOrder).toHaveBeenCalledWith({ id: 4, name: diner.name, email: diner.email }, stored);
-    expect(res.send).toHaveBeenCalledWith({ order: stored, followLinkToEndChaos: 'https://report', jwt: 'factory.jwt' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ order: { ...orderReq, id: expect.any(Number) }, followLinkToEndChaos: 'https://report.test', jwt: 'factory.jwt' });
+    expect(h.factory.calls).toEqual([{ diner: { id: diner.user.id, name: 'Dee Diner', email: diner.email }, order: res.body.order }]);
+    expect(await count('orderItem')).toBe(1);
   });
 
   test('responds 500 with the report link when the factory refuses the order', async () => {
-    const { handlers } = setup({ addDinerOrder: async () => stored }, async () => ({ ok: false, body: { reportUrl: 'https://report' } }));
-    const res = createRes();
+    const diner = await h.register();
+    const menu = await h.db.addMenuItem(item);
+    h.factory.respond = async () => ({ ok: false, body: { reportUrl: 'https://report.test' } });
 
-    await handlers.createOrder(createReq({ user: diner, body: orderReq }), res);
+    const res = await request(h.app).post('/api/order').set(diner.headers).send(orderFor(menu.id));
 
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(res.send).toHaveBeenCalledWith({ message: 'Failed to fulfill order at factory', followLinkToEndChaos: 'https://report' });
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ message: 'Failed to fulfill order at factory', followLinkToEndChaos: 'https://report.test' });
   });
 
-  test('propagates a factory network failure', async () => {
-    const { handlers } = setup({ addDinerOrder: async () => stored }, async () => {
+  test('reports a factory network failure as a 500 with its message', async () => {
+    const diner = await h.register();
+    const menu = await h.db.addMenuItem(item);
+    h.factory.respond = async () => {
       throw new Error('network down');
-    });
+    };
 
-    await expect(handlers.createOrder(createReq({ user: diner, body: orderReq }), createRes())).rejects.toThrow('network down');
+    const res = await request(h.app).post('/api/order').set(diner.headers).send(orderFor(menu.id));
+
+    expect(res.status).toBe(500);
+    expect(res.body.message).toBe('network down');
   });
 
-  test('does not call the factory when persisting the order fails', async () => {
-    const { factoryClient, handlers } = setup({
-      addDinerOrder: async () => {
-        throw new Error('No ID found');
-      },
-    });
+  test('an unknown menu item fails with 500 and never reaches the factory', async () => {
+    const diner = await h.register();
 
-    await expect(handlers.createOrder(createReq({ user: diner, body: orderReq }), createRes())).rejects.toThrow('No ID found');
-    expect(factoryClient.createOrder).not.toHaveBeenCalled();
+    const res = await request(h.app).post('/api/order').set(diner.headers).send(orderFor(9999));
+
+    expect(res.status).toBe(500);
+    expect(res.body.message).toBe('No ID found');
+    expect(h.factory.calls).toHaveLength(0);
+  });
+});
+
+describe('GET /api/order', () => {
+  test("returns only the caller's orders, with items, and pages them", async () => {
+    const diner = await h.register();
+    const other = await h.register();
+    const menu = await h.db.addMenuItem(item);
+    for (let i = 0; i < 11; i++) {
+      await h.db.addDinerOrder(diner.user, orderFor(menu.id));
+    }
+    await h.db.addDinerOrder(other.user, orderFor(menu.id));
+
+    const first = await request(h.app).get('/api/order').set(diner.headers);
+    const second = await request(h.app).get('/api/order?page=2').set(diner.headers);
+
+    expect(first.status).toBe(200);
+    expect(first.body.dinerId).toBe(diner.user.id);
+    expect(first.body.orders).toHaveLength(10);
+    expect(first.body.orders[0]).toMatchObject({ franchiseId: 1, storeId: 2, items: [{ menuId: menu.id, description: 'Veggie', price: 0.05 }] });
+    expect(second.body.orders).toHaveLength(1);
+  });
+
+  test('returns no orders for a diner who has not ordered', async () => {
+    const diner = await h.register();
+
+    const res = await request(h.app).get('/api/order').set(diner.headers);
+
+    expect(res.body.orders).toEqual([]);
   });
 });
