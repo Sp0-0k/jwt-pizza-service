@@ -63,18 +63,11 @@ describe('PUT /api/user/:userId', () => {
   });
 });
 
-// The list-users feature is not implemented yet (GET /api/user answers "not implemented" to everyone),
-// so the tests below are expected to fail until it is built.
 describe('GET /api/user (list users)', () => {
   test('requires authentication', async () => {
     const res = await request(h.app).get('/api/user');
 
     expect(res.status).toBe(401);
-  });
-
-  test('list users', async () => {
-    const listUsersRes = await request(h.app).get('/api/user');
-    expect(listUsersRes.status).toBe(200);
   });
 
   test('forbids a diner', async () => {
@@ -143,5 +136,62 @@ describe('GET /api/user (list users)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ message: 'invalid paging parameters' });
+  });
+});
+
+describe('DELETE /api/user/:userId', () => {
+  test('requires authentication', async () => {
+    const diner = await h.register();
+
+    const res = await request(h.app).delete(`/api/user/${diner.user.id}`);
+
+    expect(res.status).toBe(401);
+    expect(await h.query('SELECT id FROM user WHERE id=?', [diner.user.id])).toHaveLength(1);
+  });
+
+  test('forbids a diner from deleting anyone, changing nothing', async () => {
+    const attacker = await h.register();
+    const victim = await h.register();
+
+    const res = await request(h.app).delete(`/api/user/${victim.user.id}`).set(attacker.headers);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ message: 'unable to delete user' });
+    expect(await h.query('SELECT id FROM user WHERE id=?', [victim.user.id])).toHaveLength(1);
+  });
+
+  test('lets an admin delete a user along with their roles and sessions', async () => {
+    const admin = await h.createAdmin();
+    const diner = await h.register();
+
+    const res = await request(h.app).delete(`/api/user/${diner.user.id}`).set(admin.headers);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ message: 'user deleted' });
+    expect(await h.query('SELECT id FROM user WHERE id=?', [diner.user.id])).toEqual([]);
+    expect(await h.query('SELECT userId FROM userRole WHERE userId=?', [diner.user.id])).toEqual([]);
+    const me = await request(h.app).get('/api/user/me').set(diner.headers);
+    expect(me.status).toBe(401);
+  });
+
+  test('leaves other users untouched', async () => {
+    const admin = await h.createAdmin();
+    const doomed = await h.register();
+    const bystander = await h.register({ name: 'Bystander' });
+
+    await request(h.app).delete(`/api/user/${doomed.user.id}`).set(admin.headers);
+
+    const list = await request(h.app).get('/api/user').set(admin.headers);
+    expect(list.body.users.map((u) => u.name)).toContain('Bystander');
+    expect((await request(h.app).get('/api/user/me').set(bystander.headers)).status).toBe(200);
+  });
+
+  test('answers 404 for an unknown user', async () => {
+    const admin = await h.createAdmin();
+
+    const res = await request(h.app).delete('/api/user/999999').set(admin.headers);
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ message: 'unknown user' });
   });
 });

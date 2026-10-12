@@ -36,6 +36,14 @@ const docs = [
     example: `curl -X PUT localhost:3000/api/user/1 -d '{"name":"常用名字", "email":"a@jwt.com", "password":"admin"}' -H 'Content-Type: application/json' -H 'Authorization: Bearer tttttt'`,
     response: { user: { id: 1, name: '常用名字', email: 'a@jwt.com', roles: [{ role: 'admin' }] }, token: 'tttttt' },
   },
+  {
+    method: 'DELETE',
+    path: '/api/user/:userId',
+    requiresAuth: true,
+    description: 'Delete user (admin only)',
+    example: `curl -X DELETE localhost:3000/api/user/1 -H 'Authorization: Bearer tttttt'`,
+    response: { message: 'user deleted' },
+  },
 ];
 
 function createUserRouter({ db, auth }) {
@@ -63,12 +71,20 @@ function createUserRouter({ db, auth }) {
 
   // deleteUser
   async function deleteUser(req, res) {
-    res.json({ message: 'not implemented' });
+    if (!req.user.isRole(Role.Admin)) {
+      return res.status(403).json({ message: 'unable to delete user' });
+    }
+    await db.deleteUser(Number(req.params.userId));
+    res.json({ message: 'user deleted' });
   }
 
   // listUsers
   async function listUsers(req, res) {
-    res.json({ message: 'not implemented', users: [], more: false });
+    if (!req.user.isRole(Role.Admin)) {
+      return res.status(403).json({ message: 'unable to list users' });
+    }
+    const [users, more] = await db.getUsers(req.query.page, req.query.limit, req.query.name);
+    res.json({ users, more });
   }
 
   router.get('/me', auth.authenticateToken, asyncHandler(getMe));

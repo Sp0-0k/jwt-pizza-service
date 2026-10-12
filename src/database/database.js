@@ -108,6 +108,49 @@ class DB {
     }
   }
 
+  async deleteUser(userId) {
+    const connection = await this.getConnection();
+    try {
+      await connection.beginTransaction();
+      try {
+        const [user] = await this.query(connection, `SELECT id FROM user WHERE id=?`, [userId]);
+        if (!user) {
+          throw new StatusCodeError('unknown user', 404);
+        }
+        await this.query(connection, `DELETE FROM auth WHERE userId=?`, [userId]);
+        await this.query(connection, `DELETE FROM userRole WHERE userId=?`, [userId]);
+        await this.query(connection, `DELETE FROM user WHERE id=?`, [userId]);
+        await connection.commit();
+      } catch (err) {
+        await connection.rollback();
+        throw err;
+      }
+    } finally {
+      connection.end();
+    }
+  }
+
+  async getUsers(page = 0, limit = 10, nameFilter = '*') {
+    page = Number(page);
+    limit = Number(limit);
+    if (!Number.isInteger(page) || !Number.isInteger(limit) || page < 0 || limit < 1) {
+      throw new StatusCodeError('invalid paging parameters', 400);
+    }
+    const connection = await this.getConnection();
+    try {
+      const likePattern = nameFilter.replace(/\*/g, '%');
+      let users = await this.query(connection, `SELECT id, name, email FROM user WHERE name LIKE ? ORDER BY id LIMIT ${limit + 1} OFFSET ${page * limit}`, [likePattern]);
+      const more = users.length > limit;
+      if (more) {
+        users = users.slice(0, limit);
+      }
+      users = await Promise.all(users.map((user) => this.attachRoles(connection, user)));
+      return [users, more];
+    } finally {
+      connection.end();
+    }
+  }
+
   async attachRoles(connection, user) {
     const roleResult = await this.query(connection, `SELECT * FROM userRole WHERE userId=?`, [user.id]);
     const roles = roleResult.map((r) => {
