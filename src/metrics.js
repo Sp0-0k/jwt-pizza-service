@@ -129,7 +129,7 @@ setInterval(() => {
 
 
 function createMetric(metricName, metricValue, metricUnit, metricType, valueType, attributes) {
-  attributes = { ...attributes, source: config.dashboard.source };
+  attributes = { ...attributes, source: config.metrics.source };
 
   const metric = {
     name: metricName,
@@ -173,10 +173,10 @@ function sendMetricToGrafana(metrics) {
     ],
   };
 
-  fetch(`${config.dashboard.endpointUrl}`, {
+  fetch(`${config.metrics.endpointUrl}`, {
     method: 'POST',
     body: JSON.stringify(body),
-    headers: { Authorization: `Bearer ${config.dashboard.accountId}:${config.dashboard.apiKey}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${config.metrics.accountId}:${config.metrics.apiKey}`, 'Content-Type': 'application/json' },
   })
     .then((response) => {
       if (!response.ok) {
