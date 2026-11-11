@@ -1,4 +1,5 @@
 const defaultConfig = require('./config.js');
+const logger = require('./logger.js');
 
 function createFactoryClient({ config = defaultConfig, fetch: fetchFn = fetch } = {}) {
   return {
@@ -8,7 +9,9 @@ function createFactoryClient({ config = defaultConfig, fetch: fetchFn = fetch } 
         headers: { 'Content-Type': 'application/json', authorization: `Bearer ${config.factory.apiKey}` },
         body: JSON.stringify({ diner, order }),
       });
-      return { ok: r.ok, body: await r.json() };
+      const body = await r.json();
+      logger.logFactory({ request: { diner, order }, response: { ok: r.ok, status: r.status, body } });
+      return { ok: r.ok, body };
     },
   };
 }

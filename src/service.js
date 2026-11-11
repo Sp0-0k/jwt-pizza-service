@@ -6,6 +6,7 @@ const { createUserRouter } = require('./routes/userRouter.js');
 const version = require('./version.json');
 const config = require('./config.js');
 const { requestTracker } = require('./metrics.js');
+const logger = require('./logger.js');
 
 function createApp({ db, factoryClient }) {
   const auth = createAuth({ db });
@@ -17,6 +18,7 @@ function createApp({ db, factoryClient }) {
   const app = express();
   app.use(express.json());
   app.use(auth.setAuthUser);
+  app.use(logger.httpLogger);
   app.use(requestTracker);
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
@@ -56,6 +58,7 @@ function createApp({ db, factoryClient }) {
 
   // Default error handler for all exceptions and errors.
   app.use((err, req, res, next) => {
+    logger.logError(err);
     res.status(err.statusCode ?? 500).json({ message: err.message });
     next();
   });
