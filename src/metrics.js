@@ -61,6 +61,10 @@ function pruneActiveUsers() {
 //Middleware injection
 function requestTracker(req, res, next){
     const method = req.method.toLowerCase();
+    if (method === 'options') {
+        // Skip CORS preflight requests
+        return next();
+    }
     requests[method] = (requests[method] || 0) + 1;
     recordHttpRequest();
     const start = process.hrtime.bigint();
