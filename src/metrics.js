@@ -104,6 +104,7 @@ function getMemoryUsagePercentage() {
 
 //Sends metrics to Grafana every 20s
 setInterval(() => {
+  if (process.env.NODE_ENV === 'test') return; // tests must not push to the real Grafana
   try{
     const metrics = [];
     Object.keys(requests).forEach((method) => {
@@ -128,7 +129,7 @@ setInterval(() => {
   } catch (error) {
     console.error('Error collecting metrics:', error);
   }
-}, 20000);
+}, 20000).unref(); // unref so the timer never keeps the process (or a Jest worker) alive
 
 
 
