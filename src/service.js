@@ -5,6 +5,7 @@ const { createFranchiseRouter } = require('./routes/franchiseRouter.js');
 const { createUserRouter } = require('./routes/userRouter.js');
 const version = require('./version.json');
 const config = require('./config.js');
+const { requestTracker } = require('./metrics.js');
 
 function createApp({ db, factoryClient }) {
   const auth = createAuth({ db });
@@ -16,6 +17,7 @@ function createApp({ db, factoryClient }) {
   const app = express();
   app.use(express.json());
   app.use(auth.setAuthUser);
+  app.use(requestTracker);
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
