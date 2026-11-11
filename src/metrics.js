@@ -7,6 +7,37 @@ let totalHttpRequestCount = 0;
 let successfulLoginRequestCount = 0;
 let failedLoginRequestCount = 0;
 const activeUsers = new Map();
+let pizzasSoldCount = 0;
+let pizzaCreationFailureCount = 0;
+let revenueTotal = 0;
+
+//Latency accumulators, averaged and reset on every report
+const latency = {
+  service: { total: 0, count: 0 },
+  pizza: { total: 0, count: 0 },
+};
+
+function recordLatency(kind, ms) {
+  latency[kind].total += ms;
+  latency[kind].count++;
+}
+
+function takeAverageLatency(kind) {
+  const { total, count } = latency[kind];
+  latency[kind] = { total: 0, count: 0 };
+  return count ? total / count : null; // null = no samples this window
+}
+
+//Called by the order router after every attempt to buy pizzas
+function pizzaPurchase(success, latencyMs, price, count = 1) {
+  recordLatency('pizza', latencyMs);
+  if (success) {
+    pizzasSoldCount += count;
+    revenueTotal += price;
+  } else {
+    pizzaCreationFailureCount++;
+  }
+}
 
 //Function for tracking requests
 function recordHttpRequest() {
@@ -32,10 +63,12 @@ function requestTracker(req, res, next){
     const method = req.method.toLowerCase();
     requests[method] = (requests[method] || 0) + 1;
     recordHttpRequest();
+    const start = process.hrtime.bigint();
     if(req.user?.id){
         markActiveUser(req.user.id);
     }
     res.on('finish', () => {
+        recordLatency('service', Number(process.hrtime.bigint() - start) / 1e6);
         const requestPath = (req.originalUrl || req.path || '')
             .split('?')[0]
             .replace(/\/+$/, '') || '/';
@@ -77,6 +110,14 @@ setInterval(() => {
     metrics.push(createMetric('failedLoginRequests', failedLoginRequestCount, '1', 'sum', 'asInt', {}));
     metrics.push(createMetric('cpuUsage', getCpuUsagePercentage(), '%', 'gauge', 'asDouble', {}));
     metrics.push(createMetric('memoryUsage', getMemoryUsagePercentage(), '%', 'gauge', 'asDouble', {}));
+    metrics.push(createMetric('pizzasSold', pizzasSoldCount, '1', 'sum', 'asInt', {}));
+    metrics.push(createMetric('pizzaCreationFailures', pizzaCreationFailureCount, '1', 'sum', 'asInt', {}));
+    metrics.push(createMetric('revenue', revenueTotal, '1', 'sum', 'asDouble', {}));
+    // Skip latency gauges for idle windows so they don't drag the graph to 0
+    const serviceLatency = takeAverageLatency('service');
+    if (serviceLatency !== null) metrics.push(createMetric('serviceLatency', serviceLatency, 'ms', 'gauge', 'asDouble', {}));
+    const pizzaLatency = takeAverageLatency('pizza');
+    if (pizzaLatency !== null) metrics.push(createMetric('pizzaLatency', pizzaLatency, 'ms', 'gauge', 'asDouble', {}));
     pruneActiveUsers();
     metrics.push(createMetric('activeUsers', activeUsers.size, '1', 'gauge', 'asInt', {}));
     sendMetricToGrafana(metrics);
@@ -150,4 +191,5 @@ function sendMetricToGrafana(metrics) {
 module.exports = {
   recordHttpRequest,
   requestTracker,
+  pizzaPurchase,
 };

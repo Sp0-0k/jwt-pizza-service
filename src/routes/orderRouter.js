@@ -1,5 +1,6 @@
 const express = require('express');
 const { Role } = require('../model/model.js');
+const metrics = require('../metrics.js');
 const { asyncHandler, StatusCodeError } = require('../endpointHelper.js');
 
 const docs = [
@@ -65,7 +66,12 @@ function createOrderRouter({ db, auth, factoryClient }) {
   async function createOrder(req, res) {
     const orderReq = req.body;
     const order = await db.addDinerOrder(req.user, orderReq);
+    const start = process.hrtime.bigint();
     const { ok, body } = await factoryClient.createOrder({ id: req.user.id, name: req.user.name, email: req.user.email }, order);
+    const latencyMs = Number(process.hrtime.bigint() - start) / 1e6;
+    const items = order.items || [];
+    const price = ok ? items.reduce((sum, item) => sum + Number(item.price || 0), 0) : 0;
+    metrics.pizzaPurchase(ok, latencyMs, price, items.length);
     if (ok) {
       res.send({ order, followLinkToEndChaos: body.reportUrl, jwt: body.jwt });
     } else {
