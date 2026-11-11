@@ -1,6 +1,11 @@
 #!/bin/bash
 
-# Check if host is provided as a command line argument
+# Generates varied traffic against a JWT Pizza Service so that every Grafana
+# metric (requests by method, active users, auth success/failure, pizzas sold,
+# revenue, creation failures, latency) has meaningful, nonzero data.
+#
+# Prerequisite: ./generateData.sh <host> has been run (menu, franchise, d@/f@ users).
+
 if [ -z "$1" ]; then
   echo "Usage: $0 <host>"
   echo "Example: $0 http://localhost:3000"
@@ -8,85 +13,121 @@ if [ -z "$1" ]; then
 fi
 host=$1
 
-# Trap SIGINT (Ctrl+C) to execute the cleanup function
+pids=()
 cleanup() {
   echo "Terminating background processes..."
-  kill $pid1 $pid2 $pid3 $pid4 $pid5
+  kill "${pids[@]}" 2>/dev/null
   exit 0
 }
-trap cleanup SIGINT
+trap cleanup SIGINT SIGTERM
 
-# Wrap curl command to return HTTP response codes
+# Run a curl command and print only the HTTP status code
 execute_curl() {
-  echo $(eval "curl -s -o /dev/null -w \"%{http_code}\" $1")
+  eval "curl -s -o /dev/null -w \"%{http_code}\" $1"
 }
 
-# Function to login and get a token
+# login <email> <password> -> prints the auth token (empty on failure)
 login() {
-  response=$(curl -s -X PUT $host/api/auth -d "{\"email\":\"$1\", \"password\":\"$2\"}" -H 'Content-Type: application/json')
-  token=$(echo $response | jq -r '.token')
-  echo $token
+  curl -s -X PUT "$host/api/auth" -d "{\"email\":\"$1\", \"password\":\"$2\"}" -H 'Content-Type: application/json' | jq -r '.token // empty'
 }
 
-# Simulate a user requesting the menu every 3 seconds
+logout() {
+  execute_curl "-X DELETE $host/api/auth -H \"Authorization: Bearer $1\""
+}
+
+# Menu items (menuId:description:price) matching generateData.sh
+menu=("1:Veggie:0.0038" "2:Pepperoni:0.0042" "3:Margarita:0.0042" "4:Crusty:0.0028" "5:Charred Leopard:0.0099")
+
+# pizza_items <count> -> JSON array body of <count> random pizzas
+pizza_items() {
+  local items="" entry id desc price
+  for (( i=0; i < $1; i++ )); do
+    entry=${menu[RANDOM % ${#menu[@]}]}
+    IFS=: read -r id desc price <<< "$entry"
+    [ -n "$items" ] && items+=", "
+    items+="{ \"menuId\": $id, \"description\": \"$desc\", \"price\": $price }"
+  done
+  echo "$items"
+}
+
+# order <token> <count> -> prints HTTP status
+order() {
+  local items
+  items=$(pizza_items "$2")
+  execute_curl "-X POST $host/api/order -H 'Content-Type: application/json' -d '{\"franchiseId\": 1, \"storeId\":1, \"items\":[$items]}' -H \"Authorization: Bearer $1\""
+}
+
+# Anonymous user browsing the menu and franchises (GET traffic)
 while true; do
-  result=$(execute_curl $host/api/order/menu)
-  echo "Requesting menu..." $result
+  echo "Requesting menu..." "$(execute_curl "$host/api/order/menu")"
+  sleep 2
+  echo "Requesting franchises..." "$(execute_curl "$host/api/franchise")"
   sleep 3
 done &
-pid1=$!
+pids+=($!)
 
-# Simulate a user with an invalid email and password every 25 seconds
+# Invalid logins (failed auth attempts), every 10 seconds
 while true; do
-  result=$(execute_curl "-X PUT \"$host/api/auth\" -d '{\"email\":\"unknown@jwt.com\", \"password\":\"bad\"}' -H 'Content-Type: application/json'")
-  echo "Logging in with invalid credentials..." $result
-  sleep 25
-done &
-pid2=$!
-
-# Simulate a franchisee logging in every two minutes
-while true; do
-  token=$(login "f@jwt.com" "franchisee")
-  echo "Login franchisee..." $( [ -z "$token" ] && echo "false" || echo "true" )
-  sleep 110
-  result=$(execute_curl "-X DELETE $host/api/auth -H \"Authorization: Bearer $token\"")
-  echo "Logging out franchisee..." $result
+  echo "Logging in with invalid credentials..." "$(execute_curl "-X PUT \"$host/api/auth\" -d '{\"email\":\"unknown@jwt.com\", \"password\":\"bad\"}' -H 'Content-Type: application/json'")"
   sleep 10
 done &
-pid3=$!
+pids+=($!)
 
-# Simulate a diner ordering a pizza every 50 seconds
+# Franchisee logs in, views their franchises, logs out (active users + auth)
 while true; do
-  token=$(login "d@jwt.com" "diner")
-  echo "Login diner..." $( [ -z "$token" ] && echo "false" || echo "true" )
-  result=$(execute_curl "-X POST $host/api/order -H 'Content-Type: application/json' -d '{\"franchiseId\": 1, \"storeId\":1, \"items\":[{ \"menuId\": 1, \"description\": \"Veggie\", \"price\": 0.05 }]}'  -H \"Authorization: Bearer $token\"")
-  echo "Bought a pizza..." $result
-  sleep 20
-  result=$(execute_curl "-X DELETE $host/api/auth -H \"Authorization: Bearer $token\"")
-  echo "Logging out diner..." $result
-  sleep 30
-done &
-pid4=$!
-
-# Simulate a failed pizza order every 5 minutes
-while true; do
-  token=$(login "d@jwt.com" "diner")
-  echo "Login hungry diner..." $( [ -z "$token" ] && echo "false" || echo "true" )
-
-  items='{ "menuId": 1, "description": "Veggie", "price": 0.05 }'
-  for (( i=0; i < 21; i++ ))
-  do items+=', { "menuId": 1, "description": "Veggie", "price": 0.05 }'
+  token=$(login "f@jwt.com" "franchisee")
+  echo "Login franchisee..." "$( [ -z "$token" ] && echo false || echo true )"
+  for _ in 1 2 3; do
+    echo "Franchisee viewing profile..." "$(execute_curl "$host/api/user/me -H \"Authorization: Bearer $token\"")"
+    sleep 15
   done
-  
-  result=$(execute_curl "-X POST $host/api/order -H 'Content-Type: application/json' -d '{\"franchiseId\": 1, \"storeId\":1, \"items\":[$items]}'  -H \"Authorization: Bearer $token\"")
-  echo "Bought too many pizzas..." $result  
-  sleep 5
-  result=$(execute_curl "-X DELETE $host/api/auth -H \"Authorization: Bearer $token\"")
-  echo "Logging out hungry diner..." $result
-  sleep 295
+  echo "Logging out franchisee..." "$(logout "$token")"
+  sleep 10
 done &
-pid5=$!
+pids+=($!)
 
+# Several diners each buying a random number of pizzas (1-5) on their own cadence.
+# Registration (POST) is attempted first; it harmlessly fails if the user exists.
+for n in 1 2 3; do
+  (
+    email="diner$n@jwt.com"
+    curl -s -o /dev/null -X POST "$host/api/auth" -d "{\"name\":\"diner $n\", \"email\":\"$email\", \"password\":\"diner\"}" -H 'Content-Type: application/json'
+    while true; do
+      token=$(login "$email" "diner")
+      echo "Login $email..." "$( [ -z "$token" ] && echo false || echo true )"
+      for _ in 1 2 3; do
+        echo "$email bought pizzas..." "$(order "$token" $(( RANDOM % 5 + 1 )))"
+        echo "$email checking orders..." "$(execute_curl "$host/api/order -H \"Authorization: Bearer $token\"")"
+        sleep $(( RANDOM % 10 + 8 ))
+      done
+      echo "Logging out $email..." "$(logout "$token")"
+      sleep $(( RANDOM % 10 + 5 ))
+    done
+  ) &
+  pids+=($!)
+done
 
-# Wait for the background processes to complete
-wait $pid1 $pid2 $pid3 $pid4 $pid5
+# Original diner: one steady pizza every 30 seconds
+while true; do
+  token=$(login "d@jwt.com" "diner")
+  echo "Login diner..." "$( [ -z "$token" ] && echo false || echo true )"
+  echo "Bought a pizza..." "$(order "$token" 1)"
+  sleep 20
+  echo "Logging out diner..." "$(logout "$token")"
+  sleep 10
+done &
+pids+=($!)
+
+# Hungry diner: order >20 pizzas to trigger factory failures and high latency, every ~90 seconds
+while true; do
+  token=$(login "d@jwt.com" "diner")
+  echo "Login hungry diner..." "$( [ -z "$token" ] && echo false || echo true )"
+  echo "Bought too many pizzas..." "$(order "$token" 22)"
+  sleep 5
+  echo "Logging out hungry diner..." "$(logout "$token")"
+  sleep 85
+done &
+pids+=($!)
+
+echo "Traffic running against $host (Ctrl+C to stop)"
+wait "${pids[@]}"
