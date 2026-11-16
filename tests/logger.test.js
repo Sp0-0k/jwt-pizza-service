@@ -9,12 +9,11 @@ const config = {
 function setup(overrides = {}) {
   const fetch = jest.fn().mockResolvedValue({ ok: true });
   const logger = createLogger({ config, fetch, enabled: true, ...overrides });
-  // Returns every Loki entry that was pushed: { labels, line (parsed) }
+  // Returns every Loki entry that was pushed: { labels, line (parsed) }. Call `await logger.flush()` first.
   const entries = () =>
-    fetch.mock.calls.map(([, init]) => {
-      const { stream, values } = JSON.parse(init.body).streams[0];
-      return { labels: stream, line: JSON.parse(values[0][1]), raw: values[0][1] };
-    });
+    fetch.mock.calls.flatMap(([, init]) =>
+      JSON.parse(init.body).streams.flatMap(({ stream, values }) => values.map(([, raw]) => ({ labels: stream, line: JSON.parse(raw), raw }))),
+    );
   return { fetch, logger, entries };
 }
 
@@ -89,6 +88,7 @@ describe('PII', () => {
 
     await request(app).get('/api/user?page=2&limit=10&name=Pat%20Person');
 
+    await l.flush();
     const { line, raw } = entries()[0];
     expect(line).toMatchObject({ path: '/api/user', query: { page: 2, limit: 10 } });
     expect(raw).not.toMatch(/Pat|pat@example|Person/);
@@ -99,7 +99,8 @@ describe('log', () => {
   test('pushes a Loki stream with labels and auth header', async () => {
     const { fetch, logger, entries } = setup();
 
-    await logger.log('info', 'db', { sql: 'SELECT 1' });
+    logger.log('info', 'db', { sql: 'SELECT 1' });
+    await logger.flush();
 
     const [url, init] = fetch.mock.calls[0];
     expect(url).toBe(config.logging.endpointUrl);
@@ -111,7 +112,8 @@ describe('log', () => {
   test('uses a nanosecond timestamp string', async () => {
     const { fetch, logger } = setup();
 
-    await logger.log('info', 'db', 'x');
+    logger.log('info', 'db', 'x');
+    await logger.flush();
 
     const ts = JSON.parse(fetch.mock.calls[0][1].body).streams[0].values[0][0];
     expect(ts).toMatch(/^\d{19}$/);
@@ -119,12 +121,16 @@ describe('log', () => {
 
   test('never throws or rejects when Grafana is down or returns an error', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    const down = setup({ fetch: jest.fn().mockRejectedValue(new Error('offline')) });
+    const downFetch = jest.fn().mockRejectedValue(new Error('offline'));
+    const down = setup({ fetch: downFetch });
     const bad = setup({ fetch: jest.fn().mockResolvedValue({ ok: false, status: 401 }) });
 
-    await expect(down.logger.log('info', 'db', 'x')).resolves.toBeUndefined();
-    await expect(bad.logger.log('info', 'db', 'x')).resolves.toBeUndefined();
-    expect(errSpy).toHaveBeenCalledTimes(2);
+    down.logger.log('info', 'db', 'x');
+    bad.logger.log('info', 'db', 'x');
+    await expect(down.logger.flush()).resolves.toBeUndefined();
+    await expect(bad.logger.flush()).resolves.toBeUndefined();
+    expect(errSpy).toHaveBeenCalledTimes(2); // one summary per failed batch, after one retry each
+    expect(downFetch).toHaveBeenCalledTimes(2);
     errSpy.mockRestore();
   });
 
@@ -132,11 +138,76 @@ describe('log', () => {
     const off = setup({ enabled: false });
     const missing = setup({ config: {} });
 
-    await off.logger.log('info', 'db', 'x');
-    await missing.logger.log('info', 'db', 'x');
+    off.logger.log('info', 'db', 'x');
+    missing.logger.log('info', 'db', 'x');
+    await off.logger.flush();
+    await missing.logger.flush();
 
     expect(off.fetch).not.toHaveBeenCalled();
     expect(missing.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('batching', () => {
+  test('many log calls are sent as a single push, grouped into streams by label', async () => {
+    const { fetch, logger, entries } = setup();
+
+    for (let i = 0; i < 50; i++) logger.log('info', 'db', { i });
+    logger.log('error', 'http', { x: 1 });
+    expect(fetch).not.toHaveBeenCalled();
+    await logger.flush();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetch.mock.calls[0][1].body).streams).toHaveLength(2);
+    expect(entries()).toHaveLength(51);
+  });
+
+  test('flushing an empty queue sends nothing, and entries are not sent twice', async () => {
+    const { fetch, logger } = setup();
+
+    await logger.flush();
+    logger.log('info', 'db', 'x');
+    await logger.flush();
+    await logger.flush();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries a failed push once and succeeds', async () => {
+    const fetch = jest.fn().mockRejectedValueOnce(Object.assign(new Error('fetch failed'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } })).mockResolvedValue({ ok: true });
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const { logger } = setup({ fetch });
+
+    logger.log('info', 'db', 'x');
+    await logger.flush();
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  test('the error message includes the underlying cause code', async () => {
+    const fetch = jest.fn().mockRejectedValue(Object.assign(new Error('fetch failed'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const { logger } = setup({ fetch });
+
+    logger.log('info', 'db', 'x');
+    await logger.flush();
+
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('UND_ERR_CONNECT_TIMEOUT'));
+    errSpy.mockRestore();
+  });
+
+  test('flushes automatically every 10s', async () => {
+    jest.useFakeTimers();
+    try {
+      const { fetch, logger } = setup();
+      logger.log('info', 'db', 'x');
+      await jest.advanceTimersByTimeAsync(10000);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -165,6 +236,7 @@ describe('httpLogger', () => {
     const { logger, entries } = setup();
 
     await request(appWith(logger)).put('/api/auth').set('Authorization', 'Bearer abc').send({ email: 'a@b.c', password: 'hunter2' });
+    await logger.flush();
 
     const { labels, line, raw } = entries()[0];
     expect(labels).toMatchObject({ type: 'http', level: 'info' });
@@ -187,6 +259,7 @@ describe('httpLogger', () => {
     const { logger, entries } = setup();
 
     await request(appWith(logger)).get('/api/missing');
+    await logger.flush();
 
     expect(entries()[0].line).toMatchObject({ authorized: false, user: null, statusCode: 404, resBody: 'nope' });
     expect(entries()[0].labels.level).toBe('warn');
@@ -196,22 +269,25 @@ describe('httpLogger', () => {
     const { logger, entries } = setup();
 
     await request(appWith(logger)).get('/api/boom');
+    await logger.flush();
 
     expect(entries()[0].labels.level).toBe('error');
   });
 
   test('logs exactly one entry per request', async () => {
-    const { logger, fetch } = setup();
+    const { logger, entries } = setup();
 
     await request(appWith(logger)).put('/api/auth').send({});
+    await logger.flush();
 
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(entries()).toHaveLength(1);
   });
 
   test('DB logs made during a request carry that request\'s user, even after awaits', async () => {
     const { logger, entries } = setup();
 
     await request(appWith(logger)).get('/api/db').set('Authorization', 'Bearer abc');
+    await logger.flush();
 
     const db = entries().filter((e) => e.labels.type === 'db');
     expect(db.map((e) => e.line)).toEqual([
@@ -223,14 +299,17 @@ describe('httpLogger', () => {
 
 describe('logError filtering', () => {
   test('skips expected 4xx errors but logs 5xx and status-less errors', async () => {
-    const { logger, fetch } = setup();
+    const { logger, fetch, entries } = setup();
 
-    await logger.logError(Object.assign(new Error('forbidden'), { statusCode: 403 }));
+    logger.logError(Object.assign(new Error('forbidden'), { statusCode: 403 }));
+    await logger.flush();
     expect(fetch).not.toHaveBeenCalled();
 
-    await logger.logError(Object.assign(new Error('bad'), { statusCode: 500 }));
-    await logger.logError(new Error('surprise'));
-    expect(fetch).toHaveBeenCalledTimes(2);
+    logger.logError(Object.assign(new Error('bad'), { statusCode: 500 }));
+    logger.logError(new Error('surprise'));
+    await logger.flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(entries()).toHaveLength(2);
   });
 });
 
@@ -238,7 +317,8 @@ describe('logDb / logFactory / logError outside a request', () => {
   test('logDb masks every placeholder as ####', async () => {
     const { logger, entries } = setup();
 
-    await logger.logDb('INSERT INTO t (a, b) VALUES (?, ?)');
+    logger.logDb('INSERT INTO t (a, b) VALUES (?, ?)');
+    await logger.flush();
 
     expect(entries()[0].line.sql).toBe('INSERT INTO t (a, b) VALUES (####, ####)');
   });
@@ -246,7 +326,8 @@ describe('logDb / logFactory / logError outside a request', () => {
   test('logDb has a null user', async () => {
     const { logger, entries } = setup();
 
-    await logger.logDb('SELECT 1');
+    logger.logDb('SELECT 1');
+    await logger.flush();
 
     expect(entries()[0].line).toEqual({ sql: 'SELECT 1', user: null });
   });
@@ -254,7 +335,8 @@ describe('logDb / logFactory / logError outside a request', () => {
   test('logFactory logs request and response with secrets redacted', async () => {
     const { logger, entries } = setup();
 
-    await logger.logFactory({ request: { diner: { id: 1 }, order: {} }, response: { ok: true, body: { jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJpZCI6MX0.c2ln', reportUrl: 'u' } } });
+    logger.logFactory({ request: { diner: { id: 1 }, order: {} }, response: { ok: true, body: { jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJpZCI6MX0.c2ln', reportUrl: 'u' } } });
+    await logger.flush();
 
     const { labels, line } = entries()[0];
     expect(labels.type).toBe('factory');
@@ -266,7 +348,8 @@ describe('logDb / logFactory / logError outside a request', () => {
     const { logger, entries } = setup();
     const err = Object.assign(new Error('kaboom'), { statusCode: 500 });
 
-    await logger.logError(err);
+    logger.logError(err);
+    await logger.flush();
 
     expect(entries()[0].labels).toMatchObject({ type: 'unhandledError', level: 'error' });
     expect(entries()[0].line).toMatchObject({ message: 'kaboom', status: 500 });
