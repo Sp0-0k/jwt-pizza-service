@@ -50,6 +50,13 @@ describe('docs', () => {
     expect(res.body.version).toBe(version.version);
     expect(paths).toEqual(expect.arrayContaining(['/api/auth', '/api/user/me', '/api/order/menu', '/api/franchise/:franchiseId']));
   });
+
+  test('does not disclose server configuration to unauthenticated callers', async () => {
+    const res = await request(h.app).get('/api/docs');
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty('config');
+  });
 });
 
 describe('error handler', () => {

@@ -4,7 +4,6 @@ const { createOrderRouter } = require('./routes/orderRouter.js');
 const { createFranchiseRouter } = require('./routes/franchiseRouter.js');
 const { createUserRouter } = require('./routes/userRouter.js');
 const version = require('./version.json');
-const config = require('./config.js');
 const { requestTracker } = require('./metrics.js');
 const logger = require('./logger.js');
 
@@ -39,7 +38,6 @@ function createApp({ db, factoryClient }) {
     res.json({
       version: version.version,
       endpoints: [...authRouter.docs, ...userRouter.docs, ...orderRouter.docs, ...franchiseRouter.docs],
-      config: { factory: config.factory.url, db: config.db.connection.host },
     });
   });
 
