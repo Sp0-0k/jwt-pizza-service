@@ -28,6 +28,10 @@ module.exports =  {
    url: 'https://pizza-factory.cs329.click',
    apiKey: 'yourapikeyhere',
    },
+   // Optional. Only used when the database is created for the first time: seeds an admin user with these
+   // credentials. Choose a strong, unique password. If omitted, no admin is created; make one with
+   // `node src/init.js <name> <email> <password>`.
+   // defaultAdmin: { name: 'admin', email: 'admin@yourdomain.com', password: 'yourstrongpasswordhere' },
 };
 ```
 

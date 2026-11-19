@@ -38,6 +38,16 @@ describe('initializeDatabase', () => {
     expect(admin.roles.map((r) => r.role)).toEqual(['admin']);
   });
 
+  test('a new database gets no admin when none is configured', async () => {
+    const fresh = new DB({ config: { ...withDatabase(freshName), defaultAdmin: undefined } });
+    const addUser = jest.spyOn(fresh, 'addUser');
+
+    await fresh.init();
+
+    expect(addUser).not.toHaveBeenCalled();
+    expect(await h.serverQuery(`SELECT COUNT(*) AS n FROM ${freshName}.user`).then(([rows]) => rows[0].n)).toBe(0);
+  });
+
   test('an existing database only ensures the schema and creates no default admin', async () => {
     await new DB({ config: testConfig }).init();
 
@@ -96,6 +106,70 @@ describe('getUser', () => {
     await h.createUser(diner());
 
     await expect(db.getUser(email, password)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  describe('timing of a failed login', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    const failedLoginError = async (email, password) => db.getUser(email, password).catch((err) => err);
+
+    test('an unknown email still runs one bcrypt comparison, against a hash of the same cost as stored hashes', async () => {
+      const created = await h.createUser(diner());
+      const [{ password: storedHash }] = await h.query('SELECT password FROM user WHERE id=?', [created.id]);
+      const compare = jest.spyOn(bcrypt, 'compare');
+
+      await failedLoginError('ghost@test.com', 'pw');
+
+      expect(compare).toHaveBeenCalledTimes(1);
+      const [plain, hash] = compare.mock.calls[0];
+      expect(plain).toBe('pw');
+      expect(hash).not.toBe(storedHash);
+      expect(bcrypt.getRounds(hash)).toBe(bcrypt.getRounds(storedHash));
+    });
+
+    test('the dummy hash is computed once, not per request', async () => {
+      const hashSpy = jest.spyOn(bcrypt, 'hash');
+      const hashSyncSpy = jest.spyOn(bcrypt, 'hashSync');
+
+      await failedLoginError('ghost@test.com', 'pw');
+      await failedLoginError('ghost@test.com', 'pw');
+
+      expect(hashSpy).not.toHaveBeenCalled();
+      expect(hashSyncSpy).not.toHaveBeenCalled();
+    });
+
+    test('a known email with a wrong password also runs exactly one bcrypt comparison', async () => {
+      await h.createUser(diner());
+      const compare = jest.spyOn(bcrypt, 'compare');
+
+      await failedLoginError('d@test.com', 'wrong');
+
+      expect(compare).toHaveBeenCalledTimes(1);
+    });
+
+    test('unknown email and wrong password fail with the identical error', async () => {
+      await h.createUser(diner());
+
+      const unknownEmail = await failedLoginError('ghost@test.com', 'pw');
+      const wrongPassword = await failedLoginError('d@test.com', 'wrong');
+
+      expect(unknownEmail).toMatchObject({ message: 'unknown user', statusCode: 404 });
+      expect(wrongPassword).toMatchObject({ message: unknownEmail.message, statusCode: unknownEmail.statusCode });
+    });
+
+    test('an unknown email with a password that bcrypt cannot compare still fails with the 404', async () => {
+      await expect(db.getUser('ghost@test.com', 12345)).rejects.toMatchObject({ message: 'unknown user', statusCode: 404 });
+    });
+
+    test('an empty password is rejected without a comparison, as before', async () => {
+      await h.createUser(diner());
+      const compare = jest.spyOn(bcrypt, 'compare');
+
+      await expect(db.getUser('ghost@test.com', '')).rejects.toMatchObject({ statusCode: 404 });
+      await expect(db.getUser('d@test.com', '')).rejects.toMatchObject({ statusCode: 404 });
+
+      expect(compare).not.toHaveBeenCalled();
+    });
   });
 });
 

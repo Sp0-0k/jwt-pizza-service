@@ -12,6 +12,8 @@ if (!/^[A-Za-z0-9_]+_test_\d+$/.test(TEST_DATABASE)) {
 
 const testConfig = {
   ...baseConfig,
+  // The admin seeded into a newly created test database. These credentials are for tests only.
+  defaultAdmin: { name: '常用名字', email: 'a@jwt.com', password: 'admin' },
   db: {
     ...baseConfig.db,
     connection: { ...baseConfig.db.connection, database: TEST_DATABASE },

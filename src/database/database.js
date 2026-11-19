@@ -1,10 +1,17 @@
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const config = require('../config.js');
 const { StatusCodeError } = require('../endpointHelper.js');
 const { Role } = require('../model/model.js');
 const dbModel = require('./dbModel.js');
 const logger = require('../logger.js');
+
+// Compared against when a login names an unknown email, so that case costs a bcrypt comparison just like a known
+// email does. It is hashed once at load, with the same cost (10) that addUser and updateUser use, from a random
+// password nobody holds.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10);
+
 class DB {
   constructor({ connect, config: dbConfig = config } = {}) {
     this.config = dbConfig;
@@ -69,6 +76,11 @@ class DB {
     try {
       const userResult = await this.query(connection, `SELECT * FROM user WHERE email=?`, [email]);
       const user = userResult[0];
+      if (!user && password) {
+        // Spend the same bcrypt time as a known email would so response timing does not reveal which emails exist.
+        // The result is irrelevant (it always fails below); a malformed password makes bcrypt throw, so ignore that too.
+        await bcrypt.compare(password, DUMMY_PASSWORD_HASH).catch(() => {});
+      }
       if (!user || !password || !(await bcrypt.compare(password, user.password))) {
         throw new StatusCodeError('unknown user', 404);
       }
@@ -414,8 +426,14 @@ class DB {
         }
 
         if (!dbExists) {
-          const defaultAdmin = { name: '常用名字', email: 'a@jwt.com', password: 'admin', roles: [{ role: Role.Admin }] };
-          this.addUser(defaultAdmin);
+          // The initial admin's credentials come from the deployment's config.js. No fixed credentials are built in,
+          // so without a `defaultAdmin` entry no admin is seeded (create one with `node init.js <name> <email> <password>`).
+          const { name, email, password } = this.config.defaultAdmin ?? {};
+          if (name && email && password) {
+            this.addUser({ name, email, password, roles: [{ role: Role.Admin }] });
+          } else {
+            console.log('No defaultAdmin configured, so no admin user was created. Run init.js to create one.');
+          }
         }
       } finally {
         connection.end();

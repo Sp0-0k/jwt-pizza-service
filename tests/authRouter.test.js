@@ -83,6 +83,7 @@ describe('PUT /api/auth (login)', () => {
     const res = await request(h.app).put('/api/auth').send({ email: 'ghost@test.com', password: 'pw' });
 
     expect(res.status).toBe(404);
+    expect(res.body).toEqual({ message: 'unknown user' });
     expect(res.body).not.toHaveProperty('token');
   });
 
