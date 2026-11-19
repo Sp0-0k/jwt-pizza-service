@@ -90,14 +90,14 @@ jobs:
           cp Dockerfile dist
           cp -r src/* dist
           cp *.json dist
-          sed -i "s/root/${{ secrets.DB_USERNAME }}/g" dist/config.js
-          sed -i "s/tempdbpassword/${{ secrets.DB_PASSWORD }}/g" dist/config.js
-          sed -i "s/127.0.0.1/${{ secrets.DB_HOSTNAME }}/g" dist/config.js
+          # config.js holds secrets; it must never be part of the uploaded artifact (the deploy job writes it)
+          rm -f dist/config.js
       - name: Update distribution artifact
         uses: actions/upload-artifact@v4
         with:
           name: package
           path: dist/
+          retention-days: 1
   deploy:
     runs-on: ubuntu-latest
     permissions:
@@ -110,6 +110,51 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: package
+      - name: Write config file
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_HOSTNAME: ${{ secrets.DB_HOSTNAME }}
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          METRICS_ENDPOINT_URL: ${{ secrets.METRICS_ENDPOINT_URL }}
+          METRICS_ACCOUNT_ID: ${{ secrets.METRICS_ACCOUNT_ID }}
+          METRICS_API_KEY: ${{ secrets.METRICS_API_KEY }}
+          LOGGING_ENDPOINT_URL: ${{ secrets.LOGGING_ENDPOINT_URL }}
+          LOGGING_ACCOUNT_ID: ${{ secrets.LOGGING_ACCOUNT_ID }}
+          LOGGING_API_KEY: ${{ secrets.LOGGING_API_KEY }}
+        run: |
+          cat > config.js <<EOF
+          module.exports = {
+            jwtSecret: '${JWT_SECRET}',
+            db: {
+              connection: {
+                host: '${DB_HOSTNAME}',
+                user: '${DB_USERNAME}',
+                password: '${DB_PASSWORD}',
+                database: 'pizza',
+                connectTimeout: 60000,
+              },
+              listPerPage: 10,
+            },
+            factory: {
+              url: 'https://pizza-factory.cs329.click',
+              apiKey: '${FACTORY_API_KEY}',
+            },
+            metrics: {
+              source: 'jwt-pizza-service',
+              endpointUrl: '${METRICS_ENDPOINT_URL}',
+              accountId: '${METRICS_ACCOUNT_ID}',
+              apiKey: '${METRICS_API_KEY}',
+            },
+            logging: {
+              source: 'jwt-pizza-service',
+              endpointUrl: '${LOGGING_ENDPOINT_URL}',
+              accountId: '${LOGGING_ACCOUNT_ID}',
+              apiKey: '${LOGGING_API_KEY}',
+            },
+          };
+          EOF
       - name: Create OIDC token to AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
