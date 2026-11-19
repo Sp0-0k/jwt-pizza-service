@@ -37,6 +37,33 @@ describe('sanitize', () => {
     expect(logger.sanitize(`token is ${jwt}`)).toBe('token is *****');
   });
 
+  test('scrubs ~100k-character hostile strings in linear time (ReDoS)', () => {
+    const N = 100000;
+    const hostile = {
+      'a run with no @': 'a'.repeat(N),
+      'repeated eyJ': 'eyJ'.repeat(N / 3),
+      'eyJ run with one dot': `${'eyJ'.repeat(N / 3)}.a`,
+      'long domain without a TLD': `a@${'b'.repeat(N)}`,
+      'dotted domain': `a@${'b.'.repeat(N / 2)}`,
+      'dotted local part': 'a.'.repeat(N / 2),
+    };
+
+    const start = performance.now();
+    for (const value of Object.values(hostile)) expect(logger.sanitize(value)).toBe(value);
+    const elapsed = performance.now() - start;
+
+    expect(elapsed).toBeLessThan(1000); // the quadratic patterns needed ~10s per string at this size
+  });
+
+  test('still redacts emails and JWTs that sit after or inside a long hostile run', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJpZCI6MX0.c2ln';
+
+    expect(logger.sanitize(`${'a'.repeat(50000)} pat@example.com`)).toBe(`${'a'.repeat(50000)} *****`);
+    expect(logger.sanitize(`${'eyJ'.repeat(30000)} ${jwt}`)).toBe(`${'eyJ'.repeat(30000)} *****`);
+    expect(logger.sanitize(`${'x'.repeat(50000)}${jwt}`)).toBe(`${'x'.repeat(50000)}*****`);
+    expect(logger.sanitize(`a.${jwt}.z`)).toBe('a.*****.z');
+  });
+
   test('does not mutate its input and survives circular references', () => {
     const input = { password: 'pw' };
     input.self = input;

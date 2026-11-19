@@ -5,9 +5,14 @@ const REDACTED = '*****';
 const SENSITIVE_KEY = /pass|token|jwt|authorization|api[-_]?key|secret|cookie|email/i;
 const PERSON_NAME_KEY = /^name$/i;
 const EMAIL_KEY = /^email$/i;
-const EMAIL_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const BEARER = /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
-const JWT_SHAPED = /eyJ[\w-]+\.[\w-]+\.[\w-]+/g;
+// EMAIL_ADDRESS and JWT_SHAPED run over attacker-controlled strings, so they must stay linear. As plain patterns they
+// were retried from every offset of a long run of token characters (100k 'a's or repeated 'eyJ' took ~10s of event-loop
+// time). Each has a fallback that consumes the whole run when the real shape is absent, so the scan never revisits it;
+// the fallback also matches, so redactMatch() only redacts matches that contain the '@' / '.' of the real shape.
+const EMAIL_ADDRESS = /[A-Za-z0-9._%+-]+(?:@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?/g;
+const JWT_SHAPED = /eyJ[\w-]+\.[\w-]+\.[\w-]+|eyJ[\w-]+/g;
+const redactMatch = (marker) => (match) => (match.includes(marker) ? REDACTED : match);
 const MAX_DEPTH = 8;
 const FLUSH_INTERVAL_MS = 10000;
 const FLUSH_AT = 500; // flush early if this many lines are waiting
@@ -31,7 +36,7 @@ function sanitize(value, ancestors = new WeakSet(), depth = 0) {
         // not JSON after all, fall through to plain-string scrubbing
       }
     }
-    return value.replace(BEARER, `Bearer ${REDACTED}`).replace(JWT_SHAPED, REDACTED).replace(EMAIL_ADDRESS, REDACTED);
+    return value.replace(BEARER, `Bearer ${REDACTED}`).replace(JWT_SHAPED, redactMatch('.')).replace(EMAIL_ADDRESS, redactMatch('@'));
   }
   if (Buffer.isBuffer(value)) return '[binary]';
   if (value === null || typeof value !== 'object') return value;
